@@ -18,7 +18,7 @@ from eelbrain import NDVar, Sensor
 import mne
 import numpy as np
 
-from ._model import NCRF, RegressionData
+from ._model import NCRF, NCRFResult, RegressionData
 
 
 DEFAULT_MUs = np.logspace(-3, -1, 7)
@@ -88,7 +88,10 @@ def fit_ncrf(
         use_ES: bool = False,
         basis_std: float = 0.0085,
         do_post_normalization: bool = True,
-) -> NCRF:
+        store_theta: bool = False,
+        store_gamma: bool = False,
+        store_sigma_b: bool = False,
+) -> NCRFResult:
     r"""One shot function for cortical TRF localization.
 
     Estimate both TRFs and source variance from the observed MEG data by solving
@@ -163,10 +166,17 @@ def fit_ncrf(
     do_post_normalization
         Scales covariate matrices of different predictor variables by spectral norms to
         equalize their spectral spread (=1). (default ``True``)
+    store_theta
+        Store the ``theta`` estimate after each outer iteration in the result's
+        :class:`FitHistory` (default ``False``).
+    store_gamma
+        Store the source covariances after each outer iteration (default ``False``).
+    store_sigma_b
+        Store the data covariances after each outer iteration (default ``False``).
 
     Returns
     -------
-    :class:`NCRF`
+    :class:`NCRFResult`
         Fitted model instance.
 
     Examples
@@ -288,10 +298,10 @@ def fit_ncrf(
     if lead_field.get_dim('sensor') != ds.sensor_dim:
         lead_field = lead_field.sub(sensor=ds.sensor_dim)
 
-    model = NCRF(lead_field, noise_cov, n_iter=n_iter, n_iterc=n_iterc, n_iterf=n_iterf)
-    model.fit(ds, mu, do_crossvalidation, tol, verbose, mus=mus, n_splits=n_splits,
-              n_workers=n_workers, use_ES=use_ES, compute_explained_variance=True)
-    return model
+    estimator = NCRF(lead_field, noise_cov, n_iter=n_iter, n_iterc=n_iterc, n_iterf=n_iterf)
+    return estimator.fit(ds, mu, do_crossvalidation, tol, verbose, mus=mus, n_splits=n_splits,
+                         n_workers=n_workers, use_ES=use_ES, compute_explained_variance=True,
+                         store_theta=store_theta, store_gamma=store_gamma, store_sigma_b=store_sigma_b)
 
 
 def get_scaling(

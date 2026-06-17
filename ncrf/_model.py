@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 import copy
 import collections
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from math import sqrt, log10
 from multiprocessing import current_process
@@ -629,234 +629,196 @@ class RegressionData:
         )
 
 
-class NCRF:
-    """Result container and object-based API for NCRF.
+class ForwardModel:
+    """Forward model and noise covariance with derived whitened quantities.
+
+    The lead field and noise covariance are stored as supplied; the whitened
+    quantities used by the solver are derived (and recomputed on unpickling)
+    rather than stored.  A single instance is shared read-only across
+    cross-validation folds.
 
     Parameters
     ----------
     lead_field
-        Forward solution a.k.a. lead-field matrix, with ``sensor`` and ``source``
-        dimensions and an optional ``space`` dimension for free orientation.
+        Forward solution as a 2-D array, shape ``(n_sensors, n_sources)`` or
+        ``(n_sensors, n_sources * len(space))`` for free orientation.
     noise_covariance
-        Noise covariance matrix in sensor space, typically estimated from empty-room
-        recordings.
-    n_iter
-        Number of out iterations of the algorithm, by default set to 10.
-    n_iterc
-        Number of Champagne iterations within each outer iteration, by default set to 30.
-    n_iterf
-        Number of FASTA iterations within each outer iteration, by default set to 100.
-
-    Attributes
-    ----------
-    h
-        The neuro-current response function. It is one NDVar when fitting a single
-        predictor and a sequence of NDVars when fitting multiple predictors.
-    h_scaled
-        ``h`` with the original stimulus scaling restored.
-    explained_var
-        Fraction of total variance explained by the fitted NCRFs.
-    voxelwise_explained_variance
-        Source-wise contributions to explained variance.
-    Gamma
-        Individual source covariance matrices.
-    sigma_b
-        Data covariance estimates under the model.
-    theta
-        NCRF coefficients over the Gabor basis.
-    mu
-        Regularization parameter used for the fitted model.
-    residual
-        The fit error, i.e. the result of the ``eval_obj`` error function on the
-        final fit.
-    tstart
-        TRF start time in seconds, one value per predictor.
-    tstep
-        Sample spacing in seconds.
-    tstop
-        TRF stop time in seconds, one value per predictor.
-    basis_std
-        Standard deviation of the Gaussian basis functions in seconds.
-    stim_baseline
-        Mean that was subtracted from ``stim``.
-    stim_scaling
-        Scale by which ``stim`` was divided.
-
-    Notes
-    -----
-    Usage:
-
-    1. Use :meth:`RegressionData.from_data` to construct a prepared dataset
-       from MEG and stimulus segments.
-    2. Initialize :class:`NCRF` with the lead field and noise covariance.
-    3. Call :meth:`NCRF.fit` with the :class:`RegressionData` instance to
-       estimate the cortical TRFs.
-    4. Access the cortical TRFs in the ``NCRF.h`` attribute.
+        Sensor-space noise covariance, shape ``(n_sensors, n_sensors)``.
+    source
+        Source dimension of the forward model.
+    sensor
+        Sensor dimension of the forward model.
+    space
+        Orientation dimension (``None`` for fixed orientation).
     """
-    _name = 'cTRFs estimator'
-    _cv_results = None
-    # Attributes to be assigned after fit:
-    _data = None
-    _stim_is_single = None
-    _stim_dims = None
-    _stim_names = None
-    _stim_baseline = None
-    _stim_scaling = None
-    _stim_normalization = None
-    _basis = None
-    tstart = None
-    tstep = None
-    tstop = None
-    explained_var = None
-    _voxelwise_explained_variance = None
-    residual = None
-    mu = None
-    theta = None
-    basis_std = None
 
     def __init__(
             self,
-            lead_field: NDVar,
+            lead_field: FloatArray,
             noise_covariance: FloatArray,
-            n_iter: int = 30,
-            n_iterc: int = 10,
-            n_iterf: int = 100,
+            source,
+            sensor: Sensor,
+            space: Space | None,
     ) -> None:
-        if lead_field.has_dim('space'):
-            g = lead_field.get_data(dims=('sensor', 'source', 'space')).astype(np.float64)
-            self.lead_field = g.reshape(g.shape[0], -1)
-            self.space = lead_field.get_dim('space')
-        else:
-            g = lead_field.get_data(dims=('sensor', 'source')).astype(np.float64)
-            self.lead_field = g
-            self.space = None
-
-        self.source = lead_field.get_dim('source')
-        self.sensor = lead_field.get_dim('sensor')
-        self.noise_covariance = noise_covariance.astype(np.float64)
-        self.n_iter = n_iter
-        self.n_iterc = n_iterc
-        self.n_iterf = n_iterf
+        self.lead_field = lead_field
+        self.noise_covariance = noise_covariance
+        self.source = source
+        self.sensor = sensor
+        self.space = space
         self._prewhiten()
 
-    def __repr__(self) -> str:
-        if self.space:
-            orientation = 'free'
+    @classmethod
+    def from_lead_field(cls, lead_field: NDVar, noise_covariance: FloatArray) -> ForwardModel:
+        """Construct from an Eelbrain lead-field :class:`NDVar`."""
+        if lead_field.has_dim('space'):
+            g = lead_field.get_data(dims=('sensor', 'source', 'space')).astype(np.float64)
+            g = g.reshape(g.shape[0], -1)
+            space = lead_field.get_dim('space')
         else:
-            orientation = 'fixed'
-        return f"<[{orientation} orientation] {self._name} on {self.source!r}>"
+            g = lead_field.get_data(dims=('sensor', 'source')).astype(np.float64)
+            space = None
+        return cls(g, noise_covariance.astype(np.float64), lead_field.get_dim('source'), lead_field.get_dim('sensor'), space)
 
-    def __copy__(self) -> NCRF:
-        """Create a shallow copy with configuration but without fit results."""
-        obj = type(self).__new__(self.__class__)
-        copy_keys = ['lead_field', '_whitened_lead_field', 'lead_field_scaling', 'source', 'space', 'sensor',
-                     '_whitening_filter', 'noise_covariance', '_whitened_noise_covariance',
-                     'n_iter', 'n_iterc', 'n_iterf', 'eta', 'init_sigma_b', 'basis_std']
-        for key in copy_keys:
-            obj.__dict__.update({key: self.__dict__.get(key, None)})
-        return obj
-
-    # Primary attributes are sufficient to reconstruct the full object.  Derived
-    # attributes (_whitening_filter, _whitened_lead_field, lead_field_scaling,
-    # _whitened_noise_covariance) are recomputed by _prewhiten() and not stored.
-    _PRIMARY_ATTRS = (
-        '_basis', '_cv_results', 'mu', '_name', '_stim_is_single', '_stim_dims', '_stim_names',
-        'noise_covariance', 'n_iter', 'n_iterc', 'n_iterf', 'lead_field', '_data',
-        'explained_var', '_voxelwise_explained_variance', '_stim_baseline', '_stim_scaling',
-        'residual', 'sensor', 'source', 'space', 'theta', 'tstart', 'tstep', 'tstop',
-        'basis_std', '_stim_normalization',
-    )
-
-    def __getstate__(self) -> dict[str, Any]:
-        """Serialize the fitted model state needed for pickling."""
-        return {k: getattr(self, k) for k in self._PRIMARY_ATTRS}
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restore pickled state while keeping compatibility with older versions."""
-        for k in self._PRIMARY_ATTRS:
-            setattr(self, k, state.get(k, None))
-        if '_whitening_filter' in state:
-            # Old pickle: noise_covariance was already whitened and lead_field may also
-            # have been whitened+scaled.  Restore derived attrs directly.
-            self._whitening_filter = state['_whitening_filter']
-            self.lead_field_scaling = state.get('lead_field_scaling')
-            self._whitened_noise_covariance = self.noise_covariance
-            wlf = state.get('_whitened_lead_field')
-            self._whitened_lead_field = wlf if wlf is not None else self.lead_field
-        else:
-            self._prewhiten()
-        # make compatible with one tstop case
-        if self._stim_dims is not None:
-            self.tstop = self.tstop if isinstance(self.tstop, collections.abc.Sequence) else [self.tstop]
-            self._basis = self._basis if isinstance(self._basis, collections.abc.Sequence) else [self._basis]
-            if len(self._stim_dims) > 1:
-                if len(self.tstop) != len(self._stim_dims):
-                    self.tstop = self.tstop * len(self._stim_dims)
-                if len(self._basis) != len(self._stim_dims):
-                    self._basis = self._basis * len(self._stim_dims)
-        # make compatible with the previous version
-        if self._cv_results is None:
-            info = state.get('_cv_info')
-            if info is not None:
-                _cv_results = []
-                for items in info:
-                    if isinstance(items, np.ndarray):
-                        for columns in items.T:
-                            _cv_results.append(CVResult(*columns[[0, 1, 4, 2, 3]]))
-                setattr(self, '_cv_results', _cv_results)
-        if self.basis_std is None:
-            # Old bug: basis was always computed using std = 85 ms
-            self.basis_std = 0.0085
+    @property
+    def dc(self) -> int:
+        """Number of orientation components per source."""
+        return len(self.space) if self.space else 1
 
     def _prewhiten(self) -> None:
         """Compute whitened derived quantities from ``lead_field`` and ``noise_covariance``.
 
-        Writes to ``_whitening_filter``, ``_whitened_lead_field``,
-        ``lead_field_scaling``, and ``_whitened_noise_covariance``.
-        Neither ``lead_field`` nor ``noise_covariance`` is modified.
+        Writes ``whitening_filter``, ``whitened_lead_field``, ``lead_field_scaling``,
+        and ``whitened_noise_covariance``.  Neither ``lead_field`` nor
+        ``noise_covariance`` is modified.
         """
         wf = _inv_sqrtm(self.noise_covariance)
         if (np.var(wf, axis=1) == 0).any():
             raise ValueError("Noise covariance data contains flat channels")
-        self._whitening_filter = wf
-        self._whitened_lead_field = np.dot(wf, self.lead_field)
-        self._whitened_noise_covariance = wf.dot(self.noise_covariance).dot(wf.T)
-        self.lead_field_scaling = linalg.norm(self._whitened_lead_field, 2)
-        self._whitened_lead_field /= self.lead_field_scaling
+        self.whitening_filter = wf
+        self.whitened_lead_field = np.dot(wf, self.lead_field)
+        self.whitened_noise_covariance = wf.dot(self.noise_covariance).dot(wf.T)
+        self.lead_field_scaling = linalg.norm(self.whitened_lead_field, 2)
+        self.whitened_lead_field /= self.lead_field_scaling
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Derived (whitened) quantities are recomputed by _prewhiten() on unpickling.
+        return {
+            'lead_field': self.lead_field,
+            'noise_covariance': self.noise_covariance,
+            'source': self.source,
+            'sensor': self.sensor,
+            'space': self.space,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._prewhiten()
+
+
+@dataclass
+class FitHistory:
+    """Per-iteration quantities accumulated during fitting.
+
+    Each ``store_*`` flag selects whether the matching quantity is retained.
+    :meth:`record` appends to a list only when its flag is set, so the amount of
+    stored history can range from nothing to the full optimization trajectory.
+
+    Attributes
+    ----------
+    objective
+        Objective value after each outer iteration.
+    residual
+        Relative change in ``theta`` after each outer iteration (the convergence
+        criterion).
+    theta, gamma, sigma_b
+        Trajectories of the corresponding solver quantities; populated only when
+        the matching ``store_*`` flag is set.
+    """
+    store_objective: bool = True
+    store_residual: bool = True
+    store_theta: bool = False
+    store_gamma: bool = False
+    store_sigma_b: bool = False
+    objective: list[float] = field(default_factory=list)
+    residual: list[float] = field(default_factory=list)
+    theta: list[FloatArray] = field(default_factory=list)
+    gamma: list = field(default_factory=list)
+    sigma_b: list = field(default_factory=list)
+
+    def record(
+            self,
+            *,
+            objective: float = None,
+            residual: float = None,
+            theta: FloatArray = None,
+            gamma: object = None,
+            sigma_b: object = None,
+    ) -> None:
+        """Append the supplied quantities for which storage is enabled."""
+        if self.store_objective and objective is not None:
+            self.objective.append(objective)
+        if self.store_residual and residual is not None:
+            self.residual.append(residual)
+        if self.store_theta and theta is not None:
+            self.theta.append(theta.copy())
+        if self.store_gamma and gamma is not None:
+            self.gamma.append(copy.deepcopy(gamma))
+        if self.store_sigma_b and sigma_b is not None:
+            self.sigma_b.append(copy.deepcopy(sigma_b))
+
+
+class _Solver:
+    """Transient state and iterative optimization for a single fit.
+
+    A solver is bound to a read-only :class:`ForwardModel` and can be run on
+    different datasets (e.g. cross-validation folds) without interfering with
+    other solvers built from the same forward model.  After :meth:`run`, the
+    estimate is available in ``theta``, ``Gamma`` and ``Sigma_b``.
+    """
+
+    def __init__(
+            self,
+            forward: ForwardModel,
+            n_iter: int,
+            n_iterc: int,
+            n_iterf: int,
+    ) -> None:
+        self.forward = forward
+        self.n_iter = n_iter
+        self.n_iterc = n_iterc
+        self.n_iterf = n_iterf
+        self.mu = None
 
     def _init_from_mne(self, data: RegressionData) -> None:
         """Seed source variances from a minimum-norm style initialization."""
         eta = []
         sigma_b = []
-        dc = len(self.space) if self.space else 1
+        dc = len(self.forward.space) if self.forward.space else 1
         for y, _ in data:
             t = y.shape[1]
-            Gamma, data_cov = mne_initialization(y * (t ** 0.5), self._whitened_lead_field)
+            Gamma, data_cov = mne_initialization(y * (t ** 0.5), self.forward.whitened_lead_field)
             Gamma = np.reshape(Gamma, (-1, dc))
             eta.append([np.diag(g) for g in Gamma])
-            sigma_b.append(self._whitened_noise_covariance + data_cov)
+            sigma_b.append(self.forward.whitened_noise_covariance + data_cov)
         self.eta = eta
         self.init_sigma_b = sigma_b
 
     def _init_iter(self, data: RegressionData) -> None:
         """Initialize solver state for a new value of the regularization parameter."""
-        if self.space:
-            dc = len(self.space)
+        if self.forward.space:
+            dc = len(self.forward.space)
         else:
             dc = 1
 
         self.Gamma = []
         self.Sigma_b = []
-        # for _ in range(len(data)):
-        #     self.Gamma.append([self.eta * np.eye(dc, dtype=np.float64) for _ in range(len(self.source))])
-        #     self.Sigma_b.append(self.init_sigma_b.copy())
         for g, s in zip(self.eta, self.init_sigma_b):
             self.Gamma.append(copy.deepcopy(g))
             self.Sigma_b.append(s.copy())
 
         # initializing \Theta
         l = sum([basis.shape[1] * (len(dim) if dim else 1) for basis, dim in zip(data.basis, data.stim_dims)])
-        self.theta = np.zeros((len(self.source) * dc, l), dtype=np.float64)
+        self.theta = np.zeros((len(self.forward.source) * dc, l), dtype=np.float64)
 
     def _set_mu(self, mu: float, data: RegressionData) -> None:
         """Reset the solver state for the requested regularization value."""
@@ -891,8 +853,8 @@ class NCRF:
         """
         logger = logging.getLogger('Champagne')
         # Choose dc
-        if self.space:
-            dc = len(self.space)
+        if self.forward.space:
+            dc = len(self.forward.space)
         else:
             dc = 1
 
@@ -905,7 +867,7 @@ class NCRF:
             start = time.time()
             meg = meg[idx]
             covariates = covariates[idx]
-            y = meg - np.dot(np.dot(self._whitened_lead_field, theta), covariates.T)
+            y = meg - np.dot(np.dot(self.forward.whitened_lead_field, theta), covariates.T)
             Cb = np.dot(y, y.T)  # empirical data covariance
 
             try:
@@ -919,8 +881,6 @@ class NCRF:
                 indices = e > tol
                 yhat = v[:, indices] * np.sqrt(e[indices])[None, :]
 
-            # gamma = self.Gamma[key].copy()
-            # sigma_b = self.Sigma_b[key].copy()
             gamma = copy.deepcopy(self.eta[key])
             sigma_b = self.init_sigma_b[key].copy()
 
@@ -929,34 +889,30 @@ class NCRF:
                 # pre-compute some useful matrices
                 try:
                     Lc = linalg.cholesky(sigma_b, lower=True)
-                    lhat = linalg.solve(Lc, self._whitened_lead_field)
+                    lhat = linalg.solve(Lc, self.forward.whitened_lead_field)
                     ytilde = linalg.solve(Lc, yhat)
                 except np.linalg.LinAlgError:
                     Lc = _inv_sqrtm(sigma_b)
-                    lhat = np.dot(Lc, self._whitened_lead_field)
+                    lhat = np.dot(Lc, self.forward.whitened_lead_field)
                     ytilde = np.dot(Lc, yhat)
 
                 # compute sigma_b for the next iteration
-                sigma_b[:] = self._whitened_noise_covariance[:]
-                # tempx = lhat.T @ ytilde
+                sigma_b[:] = self.forward.whitened_noise_covariance[:]
 
-                for i in range(len(self.source)):
+                for i in range(len(self.forward.source)):
                     if dc > 1:
                         # update Xi
                         x = np.dot(gamma[i], np.dot(lhat[:, i * dc:(i + 1) * dc].T, ytilde))
-                        # x = np.dot(gamma[i], tempx[i * dc:(i + 1) * dc, :])
                         # update Zi
                         z = np.dot(lhat[:, i * dc:(i + 1) * dc].T, lhat[:, i * dc:(i + 1) * dc])
                     else:
                         # update Xi
                         x = gamma[i] * lhat[:, i].T.dot(ytilde)
-                        # x = gamma[i] * tempx[i]
                         # update Zi
                         z = (lhat[:, i] ** 2).sum()
 
                     # update Ti
                     if dc == 1:
-                        # gamma[i] = sqrt(np.einsum('i,i->',x, x)) / np.real(sqrt(z))
                         gamma[i] = sqrt((x ** 2).sum()) / np.real(sqrt(z))
                     elif dc == 3:
                         _compute_gamma_ip(z, x, gamma[i])
@@ -964,125 +920,32 @@ class NCRF:
                         gamma[i] = _compute_gamma_i(z, x)
 
                     # update sigma_b for next iteration
-                    sigma_b += np.dot(self._whitened_lead_field[:, i * dc:(i + 1) * dc],
-                                      np.dot(gamma[i], self._whitened_lead_field[:, i * dc:(i + 1) * dc].T))
+                    sigma_b += np.dot(self.forward.whitened_lead_field[:, i * dc:(i + 1) * dc],
+                                      np.dot(gamma[i], self.forward.whitened_lead_field[:, i * dc:(i + 1) * dc].T))
 
             self.Gamma[key] = gamma
             self.Sigma_b[key] = sigma_b
             end = time.time()
             logger.debug(f'{key} \t {end - start}')
 
-    def fit(
+    def run(
             self,
             data: RegressionData,
-            mu: MuArg = 'auto',
-            do_crossvalidation: bool = False,
-            tol: float = 1e-5,
+            mu: float,
+            tol: float,
+            history: FitHistory,
             verbose: bool = False,
-            use_ES: bool = False,
-            mus: MusArg = None,
-            n_splits: int = None,
-            n_workers: int = None,
-            compute_explained_variance: bool = False,
-            accept_whitening: bool = False,
     ) -> None:
-        """Fit the NCRF model to prepared regression data.
+        """Run the alternating FASTA/Champagne optimization for one ``mu``.
 
-        Estimate both TRFs and source variance from the observed MEG data by solving
-        the Bayesian optimization problem formulated in :cite:`das2020neuro`.
-
-        Parameters
-        ----------
-        data
-            M/EEG data and the corresponding stimulus variables.
-        mu
-            Regularization parameter; promote sparsity and guard against over-fitting
-        do_crossvalidation
-            if True, from a wide range of regularizing parameters, the one resulting in
-            the least generalization error in a k-fold cross-validation procedure is chosen.
-            Unless specified the range and k is chosed from cofig.py. The user can also pass
-            several keyword arguments to overwrite them.
-        tol
-            tolerence parameter. Decides when to stop outer iterations.
-        verbose
-            If set True prints intermediate values of the cost functions (default ``False``).
-        use_ES
-            use estimation stability criterion :cite:`limEstimationStabilityCrossValidation2016`
-            to choose the best ``mu`` (default ``False``).
-        mus
-            range of mu to be considered for cross-validation
-        n_splits
-            k value used in k-fold cross-validation
-        n_workers
-            Number of workers to use for cross-validation.
-            ``None`` to use ``cpu_count/2`` (default).
-            ``0`` to run without :mod:`multiprocessing`.
-        compute_explained_variance
-            Compute voxel-wise explained variance.
-        accept_whitening
-            Accept pre-whitened data. This is intended for internal workflows
-            that slice an already-whitened dataset, such as cross-validation.
+        Leaves ``theta``, ``Gamma`` and ``Sigma_b`` populated and records the
+        requested per-iteration quantities into ``history``.
         """
         logger = logging.getLogger(__name__)
-        if data.is_whitened:
-            if not accept_whitening:
-                raise ValueError("data is already whitened; pass accept_whitening=True to accept it")
-        else:
-            data = data.whiten(self._whitening_filter)
-
-        logger.info('Initiating from mne sol, please wait...')
         self._init_from_mne(data)
-        logger.info('Thanks for waiting...')
-
-        # take care of cross-validation
-        if do_crossvalidation:
-            if mus == 'auto':
-                mus = self._auto_mu(data)
-            logger.info('Crossvalidation initiated!')
-            cv_results = crossvalidate(self, data, mus, tol, n_splits, n_workers)
-            best_cv = min(cv_results, key=attrgetter('cross_fit'))
-            if best_cv.mu == min(mus):
-                logger.info(f'CVmu is {best_cv.mu}: extending range of mu towards left')
-                new_mus = np.logspace(np.log10(best_cv.mu) - 1, np.log10(best_cv.mu), 4)[:-1]
-            elif best_cv.mu == max(mus):
-                logger.info(f'CVmu is {best_cv.mu}: extending range of mu towards right')
-                new_mus = np.logspace(np.log10(best_cv.mu), np.log10(best_cv.mu) + 1, 4)[1:]
-            else:
-                new_mus = None
-
-            if new_mus is not None:
-                cv_results.extend(crossvalidate(self, data, new_mus, tol, n_splits, n_workers))
-
-            self._cv_results = cv_results
-            best_cv = min(cv_results, key=attrgetter('cross_fit'))
-            mu = best_cv.mu
-            if use_ES:
-                cv_results_ = sorted(self._cv_results, key=attrgetter('mu'))
-                if mu == cv_results[-1].mu:
-                    logger.info(f'\nCVmu is {best_cv.mu}: could not find mu based on estimation stability criterion\nContinuing with cross-validation only.')
-                else:
-                    best_es = None
-                    for i, res in enumerate(cv_results_):
-                        if res.mu < mu:
-                            continue
-                        else:
-                            try:
-                                if res.estimation_stability < cv_results_[i + 1].estimation_stability:
-                                    best_es = res
-                                    break
-                            except IndexError:
-                                best_es = None
-                    if best_es is None:
-                        logger.warning('\nNo ES minima found: could not find mu based on estimation stability criterion.\nContinuing with cross-validation only.')
-                    else:
-                        mu = best_es.mu
-
-        elif mu is None:  # use the passed mu
-            raise TypeError(f'{mu=}: mu needs mu to be a number or "auto"')
-
         self._set_mu(mu, data)
 
-        if self.space:
+        if self.forward.space:
             def g_funct(x): return g_group(x, self.mu)
             def prox_g(x, t): return proxg_group_opt(x, self.mu * t)
         else:
@@ -1090,58 +953,33 @@ class NCRF:
             def prox_g(x, t): return shrink(x, self.mu * t)
 
         theta = self.theta
-
         myname = current_process().name
 
-        self.err = []
-        self.objective_vals = []
         if verbose:
             iter_o = tqdm(range(self.n_iter))
         else:
             iter_o = range(self.n_iter)
 
         logger.debug('process:iteration \t objective value \t %% change')
-        # run iterations
         for i in iter_o:
             funct, grad_funct = self._construct_f(data)
             logger.debug(f"Before FASTA:{funct(self.theta)}")
             Theta = Fasta(funct, g_funct, grad_funct, prox_g, n_iter=self.n_iterf)
             Theta.learn(theta)
 
-            self.err.append(self._residual(theta, Theta.coefs_))
+            residual = self._residual(theta, Theta.coefs_)
+            history.record(residual=residual)
             theta = Theta.coefs_
             self.theta = theta
             logger.debug(f"After FASTA: {funct(self.theta)}")
 
-            if self.err[-1] < tol:
+            if residual < tol:
                 break
 
             self._solve(data, theta)
-
-            self.objective_vals.append(self.eval_obj(data))
-
-            logger.debug(f'{myname}:{i} \t {self.objective_vals[-1]} \t {self.err[-1] * 100}')
-
-        self.residual = self.eval_obj(data)
-        self._copy_from_data(data)
-        self.explained_var = self.compute_explained_variance(data)
-        if compute_explained_variance:
-            self._voxelwise_explained_variance = self._compute_voxelwise_explained_variance(data)
-        self._data = data  # save the data for further use
-
-    def _copy_from_data(self, data: RegressionData) -> None:
-        """Copy stimulus metadata needed to rebuild Eelbrain output objects."""
-        self._stim_is_single = data.stim_is_single
-        self._stim_dims = data.stim_dims
-        self._stim_names = data.stim_names
-        self._stim_baseline = data.baseline
-        self._stim_scaling = data.scaling
-        self._stim_normalization = data.stim_normalization
-        self._basis = data.basis
-        self.tstart = data.tstart
-        self.tstep = data.tstep
-        self.tstop = data.tstop
-        self.basis_std = data.basis_std
+            objective = self.eval_obj(data)
+            history.record(objective=objective, theta=self.theta, gamma=self.Gamma, sigma_b=self.Sigma_b)
+            logger.debug(f'{myname}:{i} \t {objective} \t {residual * 100}')
 
     def _construct_f(self, data: RegressionData) -> tuple[ObjectiveFunction, GradientFunction]:
         """Build the smooth objective and gradient passed to FASTA.
@@ -1158,12 +996,12 @@ class NCRF:
             try:
                 raise np.linalg.LinAlgError
                 L = linalg.cholesky(self.Sigma_b[i], lower=True)
-                leadfields.append(linalg.solve(L, self._whitened_lead_field))
+                leadfields.append(linalg.solve(L, self.forward.whitened_lead_field))
                 bEs.append(linalg.solve(L, data.bE[i]))
                 bbts.append(np.trace(linalg.solve(L, linalg.solve(L, data.bbt[i]).T)))
             except np.linalg.LinAlgError:
                 Linv = _inv_sqrtm(self.Sigma_b[i])
-                leadfields.append(np.dot(Linv, self._whitened_lead_field))
+                leadfields.append(np.dot(Linv, self.forward.whitened_lead_field))
                 bEs.append(np.dot(Linv, data.bE[i]))
                 bbts.append(np.trace(np.dot(Linv, np.dot(Linv, data.bbt[i]).T)))
 
@@ -1211,7 +1049,7 @@ class NCRF:
         ll2 = 0
         logdet = 0
         for key, (meg, covariate) in enumerate(data):
-            y = meg - np.dot(np.dot(self._whitened_lead_field, self.theta), covariate.T)
+            y = meg - np.dot(np.dot(self.forward.whitened_lead_field, self.theta), covariate.T)
             Cb = np.dot(y, y.T)  # empirical data covariance
             try:
                 yhat = linalg.cholesky(Cb, lower=True)
@@ -1223,8 +1061,6 @@ class NCRF:
                 indices = e > tol
                 yhat = v[:, indices] * np.sqrt(e[indices])
 
-            # L = linalg.cholesky(self.Sigma_b[key], lower=True)
-            # y = linalg.solve(L, yhat)
             sigma_b = self.Sigma_b[key]
             try:
                 Lc = linalg.cholesky(sigma_b, lower=True)
@@ -1245,8 +1081,8 @@ class NCRF:
         """Evaluate the unweighted L2 prediction error used in CV."""
         l2 = 0
         for key, (meg, covariate) in enumerate(data):
-            y = meg - np.dot(np.dot(self._whitened_lead_field, self.theta), covariate.T)
-            l2 += 0.5 * (y ** 2).sum()  # + np.log(np.diag(L)).sum()
+            y = meg - np.dot(np.dot(self.forward.whitened_lead_field, self.theta), covariate.T)
+            l2 += 0.5 * (y ** 2).sum()
 
         return l2 / len(data)
 
@@ -1255,13 +1091,9 @@ class NCRF:
         logger = logging.getLogger('NCRF: Explained Variance')
         temp = 0
         for key, (meg, covariate) in enumerate(data):
-            # W = _inv_sqrtm(self.Sigma_b[key])
-            # W_meg = W @ meg
-            # W_leadfield = W @ self._whitened_lead_field
             W_meg = meg
-            W_leadfield = self._whitened_lead_field
+            W_leadfield = self.forward.whitened_lead_field
             y = W_meg - np.dot(np.dot(W_leadfield, self.theta), covariate.T)
-            # temp += (y * y).sum() / (W_meg * W_meg).sum()  # + np.log(np.diag(L)).sum()
             temp += np.nansum(np.var(y, axis=1) / np.var(W_meg, axis=1)) / y.shape[0]
 
         logger.debug(f'{self.mu}: {1 - temp / len(data)}')
@@ -1269,28 +1101,484 @@ class NCRF:
 
     def _compute_voxelwise_explained_variance(self, data: RegressionData) -> FloatArray:
         """Compute each source's contribution to explained variance."""
-        temp = np.zeros(len(self.source))
+        temp = np.zeros(len(self.forward.source))
         theta = self.theta.copy()
         for key, (meg, covariate) in enumerate(data):
-            # W = _inv_sqrtm(self.Sigma_b[key])
-            # W_meg = W @ meg
-            # W_leadfield = W @ self._whitened_lead_field
             W_meg = meg
-            W_leadfield = self._whitened_lead_field
+            W_leadfield = self.forward.whitened_lead_field
             total_var = np.var(W_meg, axis=1)
             y = W_meg - np.dot(np.dot(W_leadfield, theta), covariate.T)
             explained_variance = np.var(y, axis=1)
-            for i, _ in enumerate(self.source):
+            for i, _ in enumerate(self.forward.source):
                 theta[:] = self.theta[:]
-                if self.space is None:
+                if self.forward.space is None:
                     theta[i] = 0
                 else:
-                    theta[i * len(self.space):(i + 1) * len(self.space)] = 0
+                    theta[i * len(self.forward.space):(i + 1) * len(self.forward.space)] = 0
                 y = W_meg - np.dot(np.dot(W_leadfield, theta), covariate.T)
-                temp[i] += np.nansum((np.var(y, axis=1) - explained_variance) / total_var) / W_meg.shape[0]  # + np.log(
-                # np.diag(L)).sum()
+                temp[i] += np.nansum((np.var(y, axis=1) - explained_variance) / total_var) / W_meg.shape[0]
 
         return temp / len(data)
+
+    def _auto_mu(self, data: RegressionData, p: float = 99.0) -> FloatArray:
+        """Infer a candidate regularization grid from the gradient magnitudes."""
+        self._set_mu(0.0, data)
+        _, grad_funct = self._construct_f(data)
+        if self.forward.space:
+            x = grad_funct(self.theta)
+            l = x.shape[1]
+            x.shape = (-1, 3, l)
+            norm = np.linalg.norm(x, axis=1)
+        else:
+            x = grad_funct(self.theta)
+            norm = np.abs(x)
+
+        hi = log10(np.percentile(norm, p))
+        lo = hi - 2
+        return np.logspace(lo, hi, 7)
+
+    @staticmethod
+    def _residual(theta0: FloatArray, theta1: FloatArray) -> float:
+        diff = theta1 - theta0
+        num = diff ** 2
+        den = theta0 ** 2
+        if den.sum() <= 0:
+            return np.inf
+        else:
+            return sqrt(num.sum() / den.sum())
+
+    @staticmethod
+    def compute_ES_metric(models: Sequence[_Solver], data: RegressionData) -> float:
+        """Compute the estimation-stability metric across cross-validation folds.
+
+        Details can be found at:
+        Lim, Chinghway, and Bin Yu. "Estimation stability with cross-validation (ESCV)."
+        Journal of Computational and Graphical Statistics 25.2 (2016): 464-492.
+
+        Parameters
+        ----------
+        models
+            Fitted fold solvers from cross-validation.
+        data
+            Dataset used to compare their predictions.
+
+        Returns
+        -------
+        float
+            Estimation-stability score.
+        """
+        Y = []
+        for model in models:
+            y = np.empty(0)
+            for trial in range(len(data)):
+                y = np.append(y, np.dot(np.dot(model.forward.whitened_lead_field, model.theta), data.covariates[trial].T))
+            Y.append(y)
+        Y = np.array(Y)
+        Y_bar = Y.mean(axis=0)
+        VarY = (((Y - Y_bar) ** 2).sum(axis=1)).mean()
+        if (Y_bar ** 2).sum() <= 0:
+            return np.inf
+        else:
+            return VarY / (Y_bar ** 2).sum()
+
+
+class NCRF:
+    """Estimator for neuro-current response functions (cTRFs).
+
+    Construct with a forward model and noise covariance, then call :meth:`fit`
+    with a :class:`RegressionData` instance to obtain an :class:`NCRFResult`.
+
+    Parameters
+    ----------
+    lead_field
+        Forward solution a.k.a. lead-field matrix, with ``sensor`` and ``source``
+        dimensions and an optional ``space`` dimension for free orientation.
+    noise_covariance
+        Noise covariance matrix in sensor space, typically estimated from empty-room
+        recordings.
+    n_iter
+        Number of outer iterations of the algorithm.
+    n_iterc
+        Number of Champagne iterations within each outer iteration.
+    n_iterf
+        Number of FASTA iterations within each outer iteration.
+
+    Notes
+    -----
+    Usage:
+
+    1. Use :meth:`RegressionData.from_data` to construct a prepared dataset
+       from MEG and stimulus segments.
+    2. Initialize :class:`NCRF` with the lead field and noise covariance.
+    3. Call :meth:`NCRF.fit` with the :class:`RegressionData` instance; it
+       returns an :class:`NCRFResult` with the estimated cortical TRFs.
+    """
+    _name = 'cTRFs estimator'
+
+    def __init__(
+            self,
+            lead_field: NDVar,
+            noise_covariance: FloatArray,
+            n_iter: int = 30,
+            n_iterc: int = 10,
+            n_iterf: int = 100,
+    ) -> None:
+        self.forward = ForwardModel.from_lead_field(lead_field, noise_covariance)
+        self.n_iter = n_iter
+        self.n_iterc = n_iterc
+        self.n_iterf = n_iterf
+
+    def __repr__(self) -> str:
+        orientation = 'free' if self.forward.space else 'fixed'
+        return f"<[{orientation} orientation] {self._name} on {self.forward.source!r}>"
+
+    def _new_solver(self) -> _Solver:
+        return _Solver(self.forward, self.n_iter, self.n_iterc, self.n_iterf)
+
+    def fit(
+            self,
+            data: RegressionData,
+            mu: MuArg = 'auto',
+            do_crossvalidation: bool = False,
+            tol: float = 1e-5,
+            verbose: bool = False,
+            use_ES: bool = False,
+            mus: MusArg = None,
+            n_splits: int = None,
+            n_workers: int = None,
+            compute_explained_variance: bool = False,
+            accept_whitening: bool = False,
+            store_theta: bool = False,
+            store_gamma: bool = False,
+            store_sigma_b: bool = False,
+    ) -> NCRFResult:
+        """Fit the NCRF model to prepared regression data.
+
+        Estimate both TRFs and source variance from the observed MEG data by solving
+        the Bayesian optimization problem formulated in :cite:`das2020neuro`.
+
+        Parameters
+        ----------
+        data
+            M/EEG data and the corresponding stimulus variables. Not mutated.
+        mu
+            Regularization parameter; promote sparsity and guard against over-fitting
+        do_crossvalidation
+            if True, from a wide range of regularizing parameters, the one resulting in
+            the least generalization error in a k-fold cross-validation procedure is chosen.
+            Unless specified the range and k is chosed from cofig.py. The user can also pass
+            several keyword arguments to overwrite them.
+        tol
+            tolerence parameter. Decides when to stop outer iterations.
+        verbose
+            If set True prints intermediate values of the cost functions (default ``False``).
+        use_ES
+            use estimation stability criterion :cite:`limEstimationStabilityCrossValidation2016`
+            to choose the best ``mu`` (default ``False``).
+        mus
+            range of mu to be considered for cross-validation
+        n_splits
+            k value used in k-fold cross-validation
+        n_workers
+            Number of workers to use for cross-validation.
+            ``None`` to use ``cpu_count/2`` (default).
+            ``0`` to run without :mod:`multiprocessing`.
+        compute_explained_variance
+            Compute voxel-wise explained variance.
+        accept_whitening
+            Accept pre-whitened data. This is intended for internal workflows
+            that slice an already-whitened dataset, such as cross-validation.
+        store_theta
+            Store the ``theta`` estimate after each outer iteration in the
+            result's :class:`FitHistory`.
+        store_gamma
+            Store the source covariances after each outer iteration.
+        store_sigma_b
+            Store the data covariances after each outer iteration.
+
+        Returns
+        -------
+        NCRFResult
+            The fitted model and estimated cortical TRFs.
+        """
+        if data.is_whitened:
+            if not accept_whitening:
+                raise ValueError("data is already whitened; pass accept_whitening=True to accept it")
+        else:
+            data = data.whiten(self.forward.whitening_filter)
+
+        history = FitHistory(store_theta=store_theta, store_gamma=store_gamma, store_sigma_b=store_sigma_b)
+        mu, cv_results = self._select_mu(data, mu, do_crossvalidation, mus, tol, n_splits, n_workers, use_ES)
+
+        solver = self._new_solver()
+        solver.run(data, mu, tol, history, verbose)
+
+        residual = solver.eval_obj(data)
+        explained_var = solver.compute_explained_variance(data)
+        if compute_explained_variance:
+            voxelwise = solver._compute_voxelwise_explained_variance(data)
+        else:
+            voxelwise = None
+
+        return NCRFResult._from_fit(solver, data, history, cv_results, residual, explained_var, voxelwise)
+
+    def _select_mu(
+            self,
+            data: RegressionData,
+            mu: MuArg,
+            do_crossvalidation: bool,
+            mus: MusArg,
+            tol: float,
+            n_splits: int,
+            n_workers: int,
+            use_ES: bool,
+    ) -> tuple[float, list[CVResult] | None]:
+        """Choose the regularization parameter, running cross-validation if requested.
+
+        Returns the chosen ``mu`` and, when cross-validation was performed, the
+        list of :class:`CVResult`.
+        """
+        logger = logging.getLogger(__name__)
+        if not do_crossvalidation:
+            if mu is None:
+                raise TypeError(f'{mu=}: fit needs mu to be a number or "auto"')
+            return mu, None
+
+        if mus == 'auto':
+            grid_solver = self._new_solver()
+            grid_solver._init_from_mne(data)
+            mus = grid_solver._auto_mu(data)
+        logger.info('Crossvalidation initiated!')
+        cv_results = crossvalidate(self, data, mus, tol, n_splits, n_workers)
+        best_cv = min(cv_results, key=attrgetter('cross_fit'))
+        if best_cv.mu == min(mus):
+            logger.info(f'CVmu is {best_cv.mu}: extending range of mu towards left')
+            new_mus = np.logspace(np.log10(best_cv.mu) - 1, np.log10(best_cv.mu), 4)[:-1]
+        elif best_cv.mu == max(mus):
+            logger.info(f'CVmu is {best_cv.mu}: extending range of mu towards right')
+            new_mus = np.logspace(np.log10(best_cv.mu), np.log10(best_cv.mu) + 1, 4)[1:]
+        else:
+            new_mus = None
+
+        if new_mus is not None:
+            cv_results.extend(crossvalidate(self, data, new_mus, tol, n_splits, n_workers))
+
+        best_cv = min(cv_results, key=attrgetter('cross_fit'))
+        mu = best_cv.mu
+        if use_ES:
+            cv_results_ = sorted(cv_results, key=attrgetter('mu'))
+            if mu == cv_results[-1].mu:
+                logger.info(f'\nCVmu is {best_cv.mu}: could not find mu based on estimation stability criterion\nContinuing with cross-validation only.')
+            else:
+                best_es = None
+                for i, res in enumerate(cv_results_):
+                    if res.mu < mu:
+                        continue
+                    else:
+                        try:
+                            if res.estimation_stability < cv_results_[i + 1].estimation_stability:
+                                best_es = res
+                                break
+                        except IndexError:
+                            best_es = None
+                if best_es is None:
+                    logger.warning('\nNo ES minima found: could not find mu based on estimation stability criterion.\nContinuing with cross-validation only.')
+                else:
+                    mu = best_es.mu
+        return mu, cv_results
+
+    def cvfunc(self, data: RegressionData, n_splits: int, tol: float, mu: float) -> CVResult:
+        return self._get_cvfunc(data, n_splits, tol)(mu)
+
+    def _get_cvfunc(
+            self,
+            data: RegressionData,
+            n_splits: int,
+            tol: float,
+    ) -> Callable[[float], CVResult]:
+        """Create the callable executed by cross-validation workers.
+
+        In the cross-validation phase the workers call this function for
+        different regularizer parameters.  Each fold is an independent
+        :class:`_Solver` built from the shared forward model.
+
+        Parameters
+        ----------
+        data
+            Dataset object compatible with model fitting and exposing
+            :meth:`ncrf.RegressionData.timeslice` for train/test partitioning.
+        n_splits
+            number of folds for cross-validation.
+        tol
+            tolerence parameter. Decides when to stop outer iterations.
+
+        Returns
+        -------
+        callable
+            Callable that evaluates one regularization value and returns the
+            cross-validation metrics.
+        """
+        from ._crossvalidation import TimeSeriesSplit
+        solvers = [self._new_solver() for _ in range(n_splits)]
+
+        def cvfunc(mu: float) -> CVResult:
+            d = max(basis.shape[1] for basis in data.basis)
+            kf = TimeSeriesSplit(r=0.05, p=n_splits, d=d)
+            ll = []
+            ll1 = []
+            ll2 = []
+            for solver, (train, test) in zip(solvers, kf.split(data.meg[0][0])):
+                traindata = data.timeslice(train)
+                testdata = data.timeslice(test)
+                solver.run(traindata, mu, tol, FitHistory(store_objective=False, store_residual=False))
+                obj, wl2 = solver.eval_obj(testdata, True)
+                ll.append(wl2)
+                ll1.append(obj)
+                ll2.append(solver.eval_l2(testdata))
+
+            time.sleep(0.001)
+            return CVResult(
+                mu,
+                sum(ll) / len(ll),  # weighted_l2_error
+                _Solver.compute_ES_metric(solvers, data),  # estimation_stability
+                sum(ll1) / len(ll1),  # cross_fit
+                sum(ll2) / len(ll2),  # l2_error
+            )
+
+        return cvfunc
+
+
+class NCRFResult:
+    """Fitted neuro-current response functions produced by :meth:`NCRF.fit`.
+
+    Attributes
+    ----------
+    h
+        The neuro-current response function. It is one NDVar when fitting a single
+        predictor and a sequence of NDVars when fitting multiple predictors.
+    h_scaled
+        ``h`` with the original stimulus scaling restored.
+    explained_var
+        Fraction of total variance explained by the fitted NCRFs.
+    voxelwise_explained_variance
+        Source-wise contributions to explained variance.
+    Gamma
+        Individual source covariance matrices.
+    Sigma_b
+        Data covariance estimates under the model.
+    theta
+        NCRF coefficients over the Gabor basis.
+    mu
+        Regularization parameter used for the fitted model.
+    residual
+        The fit error, i.e. the result of the ``eval_obj`` error function on the
+        final fit.
+    history
+        Per-iteration :class:`FitHistory` accumulated during fitting.
+    tstart
+        TRF start time in seconds, one value per predictor.
+    tstep
+        Sample spacing in seconds.
+    tstop
+        TRF stop time in seconds, one value per predictor.
+    basis_std
+        Standard deviation of the Gaussian basis functions in seconds.
+    """
+    _name = 'cTRFs estimator'
+
+    def __init__(
+            self,
+            *,
+            theta: FloatArray,
+            mu: float,
+            Gamma: list,
+            Sigma_b: list,
+            residual: float,
+            explained_var: float,
+            voxelwise_explained_variance: FloatArray | None,
+            history: FitHistory,
+            cv_results: list[CVResult] | None,
+            source,
+            space: Space | None,
+            lead_field_scaling: float,
+            stim_is_single: bool,
+            stim_dims: list,
+            stim_names: list[str],
+            stim_baseline,
+            stim_scaling,
+            stim_normalization: list,
+            basis: list[FloatArray],
+            tstart: list[float],
+            tstep: float,
+            tstop: list[float],
+            basis_std: float,
+    ) -> None:
+        self.theta = theta
+        self.mu = mu
+        self.Gamma = Gamma
+        self.Sigma_b = Sigma_b
+        self.residual = residual
+        self.explained_var = explained_var
+        self._voxelwise_explained_variance = voxelwise_explained_variance
+        self.history = history
+        self._cv_results = cv_results
+        self.source = source
+        self.space = space
+        self.lead_field_scaling = lead_field_scaling
+        self._stim_is_single = stim_is_single
+        self._stim_dims = stim_dims
+        self._stim_names = stim_names
+        self._stim_baseline = stim_baseline
+        self._stim_scaling = stim_scaling
+        self._stim_normalization = stim_normalization
+        self._basis = basis
+        self.tstart = tstart
+        self.tstep = tstep
+        self.tstop = tstop
+        self.basis_std = basis_std
+
+    @classmethod
+    def _from_fit(
+            cls,
+            solver: _Solver,
+            data: RegressionData,
+            history: FitHistory,
+            cv_results: list[CVResult] | None,
+            residual: float,
+            explained_var: float,
+            voxelwise: FloatArray | None,
+    ) -> NCRFResult:
+        """Assemble a result from a finished solver and the fitted data's metadata."""
+        forward = solver.forward
+        return cls(
+            theta=solver.theta,
+            mu=solver.mu,
+            Gamma=solver.Gamma,
+            Sigma_b=solver.Sigma_b,
+            residual=residual,
+            explained_var=explained_var,
+            voxelwise_explained_variance=voxelwise,
+            history=history,
+            cv_results=cv_results,
+            source=forward.source,
+            space=forward.space,
+            lead_field_scaling=forward.lead_field_scaling,
+            stim_is_single=data.stim_is_single,
+            stim_dims=data.stim_dims,
+            stim_names=data.stim_names,
+            stim_baseline=data.baseline,
+            stim_scaling=data.scaling,
+            stim_normalization=data.stim_normalization,
+            basis=data.basis,
+            tstart=data.tstart,
+            tstep=data.tstep,
+            tstop=data.tstop,
+            basis_std=data.basis_std,
+        )
+
+    def __repr__(self) -> str:
+        orientation = 'free' if self.space else 'fixed'
+        return f"<[{orientation} orientation] {self._name} on {self.source!r}>"
 
     @cached_property
     def voxelwise_explained_variance(self) -> NDVar | None:
@@ -1353,130 +1641,6 @@ class NCRF:
             return h[0]
         else:
             return h
-
-    @staticmethod
-    def _residual(theta0: FloatArray, theta1: FloatArray) -> float:
-        diff = theta1 - theta0
-        num = diff ** 2
-        den = theta0 ** 2
-        if den.sum() <= 0:
-            return np.inf
-        else:
-            return sqrt(num.sum() / den.sum())
-
-    @staticmethod
-    def compute_ES_metric(models: Sequence[NCRF], data: RegressionData) -> float:
-        """Compute the estimation-stability metric across cross-validation folds.
-
-        Details can be found at:
-        Lim, Chinghway, and Bin Yu. "Estimation stability with cross-validation (ESCV)."
-        Journal of Computational and Graphical Statistics 25.2 (2016): 464-492.
-
-        Parameters
-        ----------
-        models
-            Fitted models from different cross-validation folds.
-        data
-            Dataset used to compare their predictions.
-
-        Returns
-        -------
-        float
-            Estimation-stability score.
-        """
-        Y = []
-        for model in models:
-            y = np.empty(0)
-            for trial in range(len(data)):
-                y = np.append(y, np.dot(np.dot(model._whitened_lead_field, model.theta), data.covariates[trial].T))
-            Y.append(y)
-        Y = np.array(Y)
-        Y_bar = Y.mean(axis=0)
-        VarY = (((Y - Y_bar) ** 2).sum(axis=1)).mean()
-        if (Y_bar ** 2).sum() <= 0:
-            return np.inf
-        else:
-            return VarY / (Y_bar ** 2).sum()
-
-    def cvfunc(self, data: RegressionData, n_splits: int, tol: float, mu: float) -> CVResult:
-        cvfun = self._get_cvfunc(data, n_splits, tol)
-        return cvfun(mu)
-
-    def _get_cvfunc(
-            self,
-            data: RegressionData,
-            n_splits: int,
-            tol: float,
-    ) -> Callable[[float], CVResult]:
-        """Create the callable executed by cross-validation workers.
-
-        In the cross-validation phase the workers will call this function for
-        different regularizer parameters.
-
-        Parameters
-        ----------
-        data
-            Dataset object compatible with model fitting and exposing
-            :meth:`ncrf.RegressionData.timeslice` for train/test partitioning.
-        n_splits
-            number of folds for cross-validation, If None, it will use values
-            specified in config.py.
-        tol
-            tolerence parameter. Decides when to stop outer iterations.
-
-        Returns
-        -------
-        callable
-            Callable that evaluates one regularization value and returns the
-            cross-validation metrics.
-        """
-        models_ = [copy.copy(self) for _ in range(n_splits)]
-        # from sklearn.model_selection import KFold
-        from ._crossvalidation import TimeSeriesSplit
-
-        def cvfunc(mu: float) -> CVResult:
-            # kf = KFold(n_splits=n_splits)
-            d = max(basis.shape[1] for basis in data.basis)
-            kf = TimeSeriesSplit(r=0.05, p=n_splits, d=d)
-            ll = []
-            ll1 = []
-            ll2 = []
-            for model_, (train, test) in zip(models_, kf.split(data.meg[0][0])):
-                traindata = data.timeslice(train)
-                testdata = data.timeslice(test)
-                model_.fit(traindata, mu, tol=tol, verbose=False, accept_whitening=True)
-                obj, wl2 = model_.eval_obj(testdata, True)
-                ll.append(wl2)
-                ll1.append(obj)
-                ll2.append(model_.eval_l2(testdata))
-
-            time.sleep(0.001)
-            return CVResult(
-                mu,
-                sum(ll) / len(ll),  # weighted_l2_error
-                self.compute_ES_metric(models_, data),  # estimation_stability
-                sum(ll1) / len(ll1),  # cross_fit
-                sum(ll2) / len(ll2),  # l2_error
-            )
-
-        return cvfunc
-
-    def _auto_mu(self, data: RegressionData, p: float = 99.0) -> FloatArray:
-        """Infer a candidate regularization grid from the gradient magnitudes."""
-        self._set_mu(0.0, data)
-        _, grad_funct = self._construct_f(data)
-        if self.space:
-            x = grad_funct(self.theta)
-            l = x.shape[1]
-            x.shape = (-1, 3, l)
-            norm = np.linalg.norm(x, axis=1)
-        else:
-            x = grad_funct(self.theta)
-            norm = np.abs(x)
-
-        hi = log10(np.percentile(norm, p))
-        lo = hi - 2
-        return np.logspace(lo, hi, 7)
 
     def cv_info(self) -> fmtxt.Table:
         """Summarize stored cross-validation scores in a table."""

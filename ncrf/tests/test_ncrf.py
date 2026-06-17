@@ -84,6 +84,32 @@ def test_ncrf():
     assert_dataobj_equal(model_no_mp.h, model.h)
 
 
+def test_ncrf_fit_history():
+    meg = load('meg').sub(time=(0, 5))
+    stim = load('stim').sub(time=(0, 5))
+    fwd = load('fwd_sol')
+    emptyroom = load('emptyroom')
+
+    fit_kwargs = dict(tstop=0.2, normalize='l1', mu=0.0019444, n_iter=3, n_iterc=2,
+                      n_iterf=5, do_post_normalization=False)
+
+    # default: objective/residual accumulate, trajectories are not stored
+    model = fit_ncrf(meg, stim, fwd, emptyroom, **fit_kwargs)
+    assert len(model.history.objective) >= 1
+    assert len(model.history.residual) >= 1
+    assert model.history.theta == []
+    assert model.history.gamma == []
+    assert model.history.sigma_b == []
+
+    # opt-in trajectory storage
+    model = fit_ncrf(meg, stim, fwd, emptyroom, store_theta=True, store_gamma=True,
+                     store_sigma_b=True, **fit_kwargs)
+    assert len(model.history.theta) >= 1
+    assert len(model.history.gamma) == len(model.history.theta)
+    assert len(model.history.sigma_b) == len(model.history.theta)
+    assert all(theta.shape == model.theta.shape for theta in model.history.theta)
+
+
 def test_ncrf_shifted_nonzero_lags():
     meg = load('meg').sub(case=0)
     stim = load('stim').sub(case=0)
