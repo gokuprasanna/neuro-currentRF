@@ -19,7 +19,7 @@ from multiprocessing import current_process
 from operator import attrgetter
 from typing import Any, Callable, Iterator, Literal, Sequence
 
-from eelbrain import Categorial, NDVar, Scalar, Sensor, Space, UTS, fmtxt
+from eelbrain import Categorial, NDVar, Scalar, Sensor, SourceSpace, Space, UTS, fmtxt, VolumeSourceSpace
 import numpy as np
 import numpy.typing as npt
 from scipy import linalg
@@ -656,7 +656,7 @@ class ForwardModel:
             self,
             lead_field: FloatArray,
             noise_covariance: FloatArray,
-            source,
+            source: SourceSpace | VolumeSourceSpace,
             sensor: Sensor,
             space: Space | None,
     ) -> None:
@@ -805,20 +805,16 @@ class _Solver:
 
     def _init_iter(self, data: RegressionData) -> None:
         """Initialize solver state for a new value of the regularization parameter."""
-        if self.forward.space:
-            dc = len(self.forward.space)
-        else:
-            dc = 1
-
         self.Gamma = []
         self.Sigma_b = []
         for g, s in zip(self.eta, self.init_sigma_b):
             self.Gamma.append(copy.deepcopy(g))
             self.Sigma_b.append(s.copy())
 
-        # initializing \Theta
+        # initializing theta
         l = sum([basis.shape[1] * (len(dim) if dim else 1) for basis, dim in zip(data.basis, data.stim_dims)])
-        self.theta = np.zeros((len(self.forward.source) * dc, l), dtype=np.float64)
+        n_theta = self.forward.lead_field.shape[1]
+        self.theta = np.zeros((n_theta, l), dtype=np.float64)
 
     def _set_mu(self, mu: float, data: RegressionData) -> None:
         """Reset the solver state for the requested regularization value."""
