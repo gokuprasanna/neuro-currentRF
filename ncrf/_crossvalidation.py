@@ -11,10 +11,11 @@ from __future__ import annotations
 # License: BSD (3-clause)
 
 import os
+import time
 from math import ceil
 from multiprocessing import Process, Queue
 import queue
-from typing import TYPE_CHECKING, Callable, Iterator, List, Sequence
+from typing import TYPE_CHECKING, Iterator, List, Sequence
 
 from eelbrain._config import CONFIG
 import numpy as np
@@ -58,8 +59,50 @@ class CVResult:
         self.l2_error = l2_error
 
 
+def _score_mu(
+        estimator: NCRF,
+        data: RegressionData,
+        n_splits: int,
+        tol: float,
+        mu: float,
+) -> CVResult:
+    """Fit and score all cross-validation folds for one regularization value.
+
+    Each fold is fit with an independent :class:`Solver` built from the
+    estimator's shared forward model, then scored on its held-out window.
+    """
+    from ._model import NCRFModel, FitHistory  # deferred to avoid an import cycle
+
+    d = max(basis.shape[1] for basis in data.basis)
+    kf = TimeSeriesSplit(r=0.05, p=n_splits, d=d)
+    models = []
+    weighted_l2 = []
+    cross_fit = []
+    l2 = []
+    for train, test in kf.split(data.meg[0][0]):
+        traindata = data.timeslice(train)
+        testdata = data.timeslice(test)
+        solver = estimator._new_solver()
+        solver.run(traindata, mu, tol, FitHistory(store_objective=False, store_residual=False))
+        model = NCRFModel._from_solver(solver, data)
+        models.append(model)
+        obj, wl2 = model.eval_obj(testdata, True)
+        weighted_l2.append(wl2)
+        cross_fit.append(obj)
+        l2.append(model.eval_l2(testdata))
+
+    time.sleep(0.001)
+    return CVResult(
+        mu,
+        sum(weighted_l2) / len(weighted_l2),
+        NCRFModel.compute_es_metric(models, data),
+        sum(cross_fit) / len(cross_fit),
+        sum(l2) / len(l2),
+    )
+
+
 def naive_worker(
-        fun: Callable[[RegressionData, int, float, float], CVResult],
+        estimator: NCRF,
         data: RegressionData,
         n_split: int,
         tol: float,
@@ -67,23 +110,19 @@ def naive_worker(
         result_q: Queue,
 ) -> None:
     """Consume regularization values from the shared queue and score them."""
-    # myname = current_process().name
     if CONFIG['nice']:
         os.nice(CONFIG['nice'])
     while True:
         try:
             job = job_q.get_nowait()
-            # print('%s got %s mus...' % (myname, len(job)))
             for mu in job:
-                result_q.put(fun(data, n_split, tol, mu))
-            # print('%s done' % myname)
+                result_q.put(_score_mu(estimator, data, n_split, tol, mu))
         except queue.Empty:
-            # print('returning from %s process' % myname)
             return
 
 
 def start_workers(
-        fun: Callable[[RegressionData, int, float, float], CVResult],
+        estimator: NCRF,
         data: RegressionData,
         n_split: int,
         tol: float,
@@ -96,14 +135,14 @@ def start_workers(
     for i in range(nprocs):
         p = Process(
             target=naive_worker,
-            args=(fun, data, n_split, tol, shared_job_q, shared_result_q))
+            args=(estimator, data, n_split, tol, shared_job_q, shared_result_q))
         procs.append(p)
         p.start()
     return procs
 
 
 def crossvalidate(
-        model: NCRF,
+        estimator: NCRF,
         data: RegressionData,
         mus: Sequence[float],
         tol: float,
@@ -112,16 +151,15 @@ def crossvalidate(
 ) -> List[CVResult]:
     """Perform cross-validation over a set of regularization values.
 
-    This function assumes `model` class has method _get_cvfunc(data, n_splits)
-    which returns a callable. It calls that object with different
-    regularizing weights (i.e. mus) to compute cross-validation metric and
-    finally compares them to obtain the best weight.
+    For each regularizing weight in ``mus`` the folds are fit and scored by
+    :func:`_score_mu`, and the resulting :class:`CVResult` objects are returned
+    for the caller to compare.
 
     Parameters
     ----------
-    model
-        the model to be validated, here `NCRF`. In addition to that it needs to
-        support the :func:`copy.copy` function.
+    estimator
+        The :class:`NCRF` estimator to validate. It must be picklable so that it
+        can be sent to worker processes.
     data
         M/EEG data and the corresponding stimulus variables.
     mus
@@ -149,7 +187,7 @@ def crossvalidate(
 
     if n_workers == 0:
         for mu in mus:
-            result = model.cvfunc(data, n_splits, tol, mu)
+            result = _score_mu(estimator, data, n_splits, tol, mu)
             results.append(result)
             prog.update(n=len(results))
         return results
@@ -160,7 +198,7 @@ def crossvalidate(
     for mu in mus:
         job_q.put([mu])  # put the job as a list.
 
-    workers = start_workers(model.cvfunc, data, n_splits, tol, job_q, result_q, n_workers)
+    workers = start_workers(estimator, data, n_splits, tol, job_q, result_q, n_workers)
 
     for _ in range(len(mus)):
         result = result_q.get()

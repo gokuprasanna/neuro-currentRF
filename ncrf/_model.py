@@ -1586,69 +1586,6 @@ class NCRF:
                     mu = best_es.mu
         return mu, cv_results
 
-    def cvfunc(self, data: RegressionData, n_splits: int, tol: float, mu: float) -> CVResult:
-        return self._get_cvfunc(data, n_splits, tol)(mu)
-
-    def _get_cvfunc(
-            self,
-            data: RegressionData,
-            n_splits: int,
-            tol: float,
-    ) -> Callable[[float], CVResult]:
-        """Create the callable executed by cross-validation workers.
-
-        In the cross-validation phase the workers call this function for
-        different regularizer parameters.  Each fold is an independent
-        :class:`Solver` built from the shared forward model.
-
-        Parameters
-        ----------
-        data
-            Dataset object compatible with model fitting and exposing
-            :meth:`ncrf.RegressionData.timeslice` for train/test partitioning.
-        n_splits
-            number of folds for cross-validation.
-        tol
-            tolerence parameter. Decides when to stop outer iterations.
-
-        Returns
-        -------
-        callable
-            Callable that evaluates one regularization value and returns the
-            cross-validation metrics.
-        """
-        from ._crossvalidation import TimeSeriesSplit
-
-        def cvfunc(mu: float) -> CVResult:
-            d = max(basis.shape[1] for basis in data.basis)
-            kf = TimeSeriesSplit(r=0.05, p=n_splits, d=d)
-            models = []
-            ll = []
-            ll1 = []
-            ll2 = []
-            for (train, test) in kf.split(data.meg[0][0]):
-                traindata = data.timeslice(train)
-                testdata = data.timeslice(test)
-                solver = self._new_solver()
-                solver.run(traindata, mu, tol, FitHistory(store_objective=False, store_residual=False))
-                model = NCRFModel._from_solver(solver, data)
-                models.append(model)
-                obj, wl2 = model.eval_obj(testdata, True)
-                ll.append(wl2)
-                ll1.append(obj)
-                ll2.append(model.eval_l2(testdata))
-
-            time.sleep(0.001)
-            return CVResult(
-                mu,
-                sum(ll) / len(ll),  # weighted_l2_error
-                NCRFModel.compute_es_metric(models, data),  # estimation_stability
-                sum(ll1) / len(ll1),  # cross_fit
-                sum(ll2) / len(ll2),  # l2_error
-            )
-
-        return cvfunc
-
 
 class NCRFResult:
     """Report produced by :meth:`NCRF.fit`.
