@@ -101,12 +101,13 @@ def g_group(x: FloatArray, mu: float) -> float:
             gg(x) = \sum ||x_s_{i,t}||
 
     where s_{i,t} = {x_{j,t}: j = 1*dc:(i+1)*dc}, i \in {1,2,...,#sources}, t \in {1,2,...,M}
+
+    The three orientation components per source (fixed ``dc == 3``) are grouped
+    along a reshaped view, so the caller's array is not modified.
     """
     l = x.shape[1]
-    x.shape = (-1, 3, l)
-    val = mu * np.sqrt((x ** 2).sum(axis=1)).sum()
-    x.shape = (-1, l)
-    return val
+    x3 = x.reshape(-1, 3, l)
+    return mu * np.sqrt((x3 ** 2).sum(axis=1)).sum()
 
 
 def proxg_group_opt(z: FloatArray, mu: float) -> FloatArray:
@@ -115,14 +116,14 @@ def proxg_group_opt(z: FloatArray, mu: float) -> FloatArray:
             prox_{mu gg}(x) = min  gg(z) + 1/ (2 * mu) ||x-z|| ** 2
                     x_s = max(1 - mu/||z_s||, 0) z_s
 
-    Note: It does update the supplied z. It is a wrapper for distributed Cython code.
+    Wrapper for the Cython kernel. The three orientation components per source
+    (fixed ``dc == 3``) are grouped along a reshaped view; the shrinkage is
+    written into that view in place, so the returned array shares ``z``'s buffer.
     """
-    # x = z.view()
     l = z.shape[1]
-    z.shape = (-1, 3, l)
-    opt.cproxg_group(z, mu, z)
-    z.shape = (-1, l)
-    return z
+    z3 = z.reshape(-1, 3, l)
+    opt.cproxg_group(z3, mu, z3)
+    return z3.reshape(-1, l)
 
 
 def covariate_from_stim(
