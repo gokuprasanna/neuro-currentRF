@@ -767,13 +767,91 @@ class FitHistory:
             self.sigma_b.append(copy.deepcopy(sigma_b))
 
 
-class _Solver:
+def _evaluate_objective(
+        forward: ForwardModel,
+        theta: FloatArray,
+        Sigma_b: list,
+        data: RegressionData,
+        return_wl2: bool = False,
+) -> float | tuple[float, float]:
+    """Negative-log-likelihood objective for whitened ``data`` given the weights.
+
+    Shared by the optimizer (:meth:`Solver.run`, for its history) and the fitted
+    model (:meth:`NCRFModel.eval_obj`); depends only on ``forward``/``theta``/
+    ``Sigma_b``. ``data`` must already be whitened.
+    """
+    ll2 = 0
+    logdet = 0
+    for key, (meg, covariate) in enumerate(data):
+        y = meg - np.dot(np.dot(forward.whitened_lead_field, theta), covariate.T)
+        Cb = np.dot(y, y.T)  # empirical data covariance
+        try:
+            yhat = linalg.cholesky(Cb, lower=True)
+        except np.linalg.LinAlgError:
+            hi = y.shape[0] - 1
+            lo = max(y.shape[0] - y.shape[1], 0)
+            e, v = linalg.eigh(Cb, subset_by_index=(lo, hi))
+            tol = e[-1] * _R_tol
+            indices = e > tol
+            yhat = v[:, indices] * np.sqrt(e[indices])
+
+        sigma_b = Sigma_b[key]
+        try:
+            Lc = linalg.cholesky(sigma_b, lower=True)
+            y = linalg.solve(Lc, yhat)
+            logdet_ = np.log(np.diag(Lc)).sum()
+        except np.linalg.LinAlgError:
+            Lc, e = _inv_sqrtm(sigma_b, return_eig=True)
+            y = np.dot(Lc, yhat)
+            logdet_ = -np.log(e).sum()
+
+        ll2 += 0.5 * (y ** 2).sum()
+        logdet += logdet_
+    if return_wl2:
+        return (ll2 + logdet) / len(data), ll2 / len(data)
+    return (ll2 + logdet) / len(data)
+
+
+class Solver:
     """Transient state and iterative optimization for a single fit.
 
-    A solver is bound to a read-only :class:`ForwardModel` and can be run on
-    different datasets (e.g. cross-validation folds) without interfering with
-    other solvers built from the same forward model.  After :meth:`run`, the
-    estimate is available in ``theta``, ``Gamma`` and ``Sigma_b``.
+    A solver is bound to a read-only :class:`ForwardModel`.  It can be run on
+    different datasets (e.g. cross-validation folds) without interfering with other
+    solvers built from the same forward model.  After :meth:`run`, the estimate is
+    available in ``theta``, ``Gamma`` and ``Sigma_b``.
+
+    Parameters
+    ----------
+    forward
+        Shared, read-only forward model.
+    n_iter
+        Number of outer iterations.
+    n_iterc
+        Number of Champagne iterations per outer iteration.
+    n_iterf
+        Number of FASTA iterations per outer iteration.
+
+    Attributes
+    ----------
+    forward, n_iter, n_iterc, n_iterf
+        Configuration, fixed for the lifetime of the solver (see Parameters).
+    mu
+        Regularization parameter; ``None`` until set by :meth:`run`. Read by
+        :meth:`NCRFResult._from_fit`. Not used by :meth:`gradient`.
+    theta
+        TRF coefficients over the Gabor basis; the main estimate. ``None`` until
+        :meth:`run` (or :meth:`gradient`) initializes it. Read by
+        :meth:`NCRFResult._from_fit`.
+    Gamma
+        Per-trial source covariance estimates. ``None`` until initialized; read
+        by :meth:`NCRFResult._from_fit`.
+    Sigma_b
+        Per-trial data covariance estimates. ``None`` until initialized; read by
+        :meth:`NCRFResult._from_fit`.
+    _init_gamma, _init_sigma_b
+        Per-trial initialization seeds (initial source variances and data
+        covariances) computed once in :meth:`_initialize`; ``theta``,
+        ``Gamma`` and ``Sigma_b`` are seeded from these.
     """
 
     def __init__(
@@ -783,51 +861,50 @@ class _Solver:
             n_iterc: int,
             n_iterf: int,
     ) -> None:
+        # configuration (immutable)
         self.forward = forward
         self.n_iter = n_iter
         self.n_iterc = n_iterc
         self.n_iterf = n_iterf
-        self.mu = None
+        # regularization (set by run())
+        self.mu: float | None = None
+        # initialization seeds (set by _initialize)
+        self._init_gamma: list | None = None
+        self._init_sigma_b: list[FloatArray] | None = None
+        # working estimate (set during run())
+        self.theta: FloatArray | None = None
+        self.Gamma: list | None = None
+        self.Sigma_b: list[FloatArray] | None = None
 
-    def _init_from_mne(self, data: RegressionData) -> None:
-        """Seed source variances from a minimum-norm style initialization."""
-        eta = []
-        sigma_b = []
-        dc = len(self.forward.space) if self.forward.space else 1
+    def _initialize(self, data: RegressionData) -> None:
+        """Seed solver state from a minimum-norm style initialization.
+
+        Called once per solver, from the alternative entry points :meth:`run` and
+        :meth:`gradient` (each used on its own solver instance, so this never runs
+        twice on the same solver). Computes the MNE seeds ``_init_gamma`` /
+        ``_init_sigma_b`` — which :meth:`_solve` re-reads at the start of every
+        Champagne solve — and seeds the working estimate ``theta`` / ``Gamma`` /
+        ``Sigma_b``.
+        """
+        # MNE-based seeds (re-read by _solve on every Champagne solve)
+        self._init_gamma = []
+        self._init_sigma_b = []
         for y, _ in data:
             t = y.shape[1]
-            Gamma, data_cov = mne_initialization(y * (t ** 0.5), self.forward.whitened_lead_field)
-            Gamma = np.reshape(Gamma, (-1, dc))
-            eta.append([np.diag(g) for g in Gamma])
-            sigma_b.append(self.forward.whitened_noise_covariance + data_cov)
-        self.eta = eta
-        self.init_sigma_b = sigma_b
-
-    def _init_iter(self, data: RegressionData) -> None:
-        """Initialize solver state for a new value of the regularization parameter."""
-        self.Gamma = []
-        self.Sigma_b = []
-        for g, s in zip(self.eta, self.init_sigma_b):
-            self.Gamma.append(copy.deepcopy(g))
-            self.Sigma_b.append(s.copy())
-
-        # initializing theta
-        l = sum([basis.shape[1] * (len(dim) if dim else 1) for basis, dim in zip(data.basis, data.stim_dims)])
-        n_theta = self.forward.lead_field.shape[1]
-        self.theta = np.zeros((n_theta, l), dtype=np.float64)
-
-    def _set_mu(self, mu: float, data: RegressionData) -> None:
-        """Reset the solver state for the requested regularization value."""
-        self.mu = mu
-        self._init_iter(data)
-        if mu == 0.0:
-            self._solve(data, self.theta, n_iterc=30)
+            gamma, data_cov = mne_initialization(y * (t ** 0.5), self.forward.whitened_lead_field)
+            gamma = np.reshape(gamma, (-1, self.forward.dc))
+            self._init_gamma.append([np.diag(g) for g in gamma])
+            self._init_sigma_b.append(self.forward.whitened_noise_covariance + data_cov)
+        # working estimate, seeded from the above
+        self.Gamma = [copy.deepcopy(g) for g in self._init_gamma]
+        self.Sigma_b = [s.copy() for s in self._init_sigma_b]
+        l = sum(basis.shape[1] * (len(dim) if dim else 1) for basis, dim in zip(data.basis, data.stim_dims))
+        self.theta = np.zeros((self.forward.lead_field.shape[1], l), dtype=np.float64)
 
     def _solve(
             self,
             data: RegressionData,
             theta: FloatArray,
-            idx: slice | IndexArray = slice(None, None),
             n_iterc: int | None = None,
     ) -> None:
         """Champagne steps implementation
@@ -861,24 +938,18 @@ class _Solver:
         logger.debug('trial \t time taken')
         for key, (meg, covariates) in enumerate(data):
             start = time.time()
-            meg = meg[idx]
-            covariates = covariates[idx]
             y = meg - np.dot(np.dot(self.forward.whitened_lead_field, theta), covariates.T)
             Cb = np.dot(y, y.T)  # empirical data covariance
 
-            try:
-                raise np.linalg.LinAlgError
-                yhat = linalg.cholesky(Cb, lower=True)
-            except np.linalg.LinAlgError:
-                hi = y.shape[0] - 1
-                lo = max(y.shape[0] - y.shape[1], 0)
-                e, v = linalg.eigh(Cb, subset_by_index=(lo, hi))
-                tol = e[-1] * _R_tol
-                indices = e > tol
-                yhat = v[:, indices] * np.sqrt(e[indices])[None, :]
+            hi = y.shape[0] - 1
+            lo = max(y.shape[0] - y.shape[1], 0)
+            e, v = linalg.eigh(Cb, subset_by_index=(lo, hi))
+            tol = e[-1] * _R_tol
+            indices = e > tol
+            yhat = v[:, indices] * np.sqrt(e[indices])[None, :]
 
-            gamma = copy.deepcopy(self.eta[key])
-            sigma_b = self.init_sigma_b[key].copy()
+            gamma = copy.deepcopy(self._init_gamma[key])
+            sigma_b = self._init_sigma_b[key].copy()
 
             # champagne iterations
             for it in range(n_iterc):
@@ -932,14 +1003,14 @@ class _Solver:
             history: FitHistory,
             verbose: bool = False,
     ) -> None:
-        """Run the alternating FASTA/Champagne optimization for one ``mu``.
+        """Run the alternating FASTA/Champagne optimization for regularization ``mu``.
 
         Leaves ``theta``, ``Gamma`` and ``Sigma_b`` populated and records the
         requested per-iteration quantities into ``history``.
         """
         logger = logging.getLogger(__name__)
-        self._init_from_mne(data)
-        self._set_mu(mu, data)
+        self.mu = mu
+        self._initialize(data)
 
         if self.forward.space:
             def g_funct(x): return g_group(x, self.mu)
@@ -973,7 +1044,7 @@ class _Solver:
                 break
 
             self._solve(data, theta)
-            objective = self.eval_obj(data)
+            objective = _evaluate_objective(self.forward, self.theta, self.Sigma_b, data)
             history.record(objective=objective, theta=self.theta, gamma=self.Gamma, sigma_b=self.Sigma_b)
             logger.debug(f'{myname}:{i} \t {objective} \t {residual * 100}')
 
@@ -989,17 +1060,10 @@ class _Solver:
         bEs = []
         bbts = []
         for i in range(len(data)):
-            try:
-                raise np.linalg.LinAlgError
-                L = linalg.cholesky(self.Sigma_b[i], lower=True)
-                leadfields.append(linalg.solve(L, self.forward.whitened_lead_field))
-                bEs.append(linalg.solve(L, data.bE[i]))
-                bbts.append(np.trace(linalg.solve(L, linalg.solve(L, data.bbt[i]).T)))
-            except np.linalg.LinAlgError:
-                Linv = _inv_sqrtm(self.Sigma_b[i])
-                leadfields.append(np.dot(Linv, self.forward.whitened_lead_field))
-                bEs.append(np.dot(Linv, data.bE[i]))
-                bbts.append(np.trace(np.dot(Linv, np.dot(Linv, data.bbt[i]).T)))
+            Linv = _inv_sqrtm(self.Sigma_b[i])
+            leadfields.append(np.dot(Linv, self.forward.whitened_lead_field))
+            bEs.append(np.dot(Linv, data.bE[i]))
+            bbts.append(np.trace(np.dot(Linv, np.dot(Linv, data.bbt[i]).T)))
 
         def f(L, x, bbt, bE, EtE):
             Lx = np.dot(L, x)
@@ -1024,17 +1088,150 @@ class _Solver:
 
         return funct, grad_funct
 
+    def gradient(self, data: RegressionData) -> FloatArray:
+        """Per-source gradient magnitude of the data-fit term at the zero estimate.
+
+        Runs an unregularized warm covariance solve and returns the magnitude of
+        the smooth objective's gradient at ``theta = 0``, used to calibrate the
+        regularization grid (see :func:`find_mu_range`). Independent of ``mu``.
+        """
+        self._initialize(data)
+        self._solve(data, self.theta, n_iterc=30)
+        _, grad_funct = self._construct_f(data)
+        x = grad_funct(self.theta)
+        if self.forward.space:
+            x = x.reshape(-1, self.forward.dc, x.shape[1])
+            return np.linalg.norm(x, axis=1)
+        return np.abs(x)
+
+    @staticmethod
+    def _residual(theta0: FloatArray, theta1: FloatArray) -> float:
+        diff = theta1 - theta0
+        num = diff ** 2
+        den = theta0 ** 2
+        if den.sum() <= 0:
+            return np.inf
+        else:
+            return sqrt(num.sum() / den.sum())
+
+
+def find_mu_range(gradient: FloatArray, p: float = 99.0) -> FloatArray:
+    """Regularization grid spanning two decades up to the gradient's p-th percentile."""
+    hi = log10(np.percentile(gradient, p))
+    return np.logspace(hi - 2, hi, 7)
+
+
+class NCRFModel:
+    """Frozen, fitted NCRF model that can be applied to arbitrary datasets.
+
+    Holds the estimated weights together with the forward model and stimulus
+    metadata needed to evaluate (and, in the future, predict) on any
+    :class:`RegressionData`.  Reusable and picklable; produced by :meth:`NCRF.fit`
+    and exposed as :attr:`NCRFResult.model`.
+
+    Attributes
+    ----------
+    forward
+        The :class:`ForwardModel` (lead field, whitening filter, source/sensor/space).
+    theta
+        NCRF coefficients over the Gabor basis; the frozen weights.
+    Gamma
+        Per-trial source covariance estimates.
+    Sigma_b
+        Per-trial data covariance estimates (used by :meth:`eval_obj`).
+    mu
+        Regularization parameter used to fit the weights.
+    tstart, tstep, tstop, basis_std
+        TRF timing and Gaussian-basis width.
+    """
+    _name = 'cTRFs estimator'
+
+    def __init__(
+            self,
+            *,
+            forward: ForwardModel,
+            theta: FloatArray,
+            Gamma: list,
+            Sigma_b: list,
+            mu: float,
+            stim_is_single: bool,
+            stim_dims: list,
+            stim_names: list[str],
+            stim_baseline,
+            stim_scaling,
+            stim_normalization: list,
+            basis: list[FloatArray],
+            tstart: list[float],
+            tstep: float,
+            tstop: list[float],
+            basis_std: float,
+    ) -> None:
+        self.forward = forward
+        self.theta = theta
+        self.Gamma = Gamma
+        self.Sigma_b = Sigma_b
+        self.mu = mu
+        self._stim_is_single = stim_is_single
+        self._stim_dims = stim_dims
+        self._stim_names = stim_names
+        self._stim_baseline = stim_baseline
+        self._stim_scaling = stim_scaling
+        self._stim_normalization = stim_normalization
+        self._basis = basis
+        self.tstart = tstart
+        self.tstep = tstep
+        self.tstop = tstop
+        self.basis_std = basis_std
+
+    @classmethod
+    def _from_solver(cls, solver: Solver, data: RegressionData) -> NCRFModel:
+        """Freeze a finished solver together with the fitted data's metadata."""
+        return cls(
+            forward=solver.forward,
+            theta=solver.theta,
+            Gamma=solver.Gamma,
+            Sigma_b=solver.Sigma_b,
+            mu=solver.mu,
+            stim_is_single=data.stim_is_single,
+            stim_dims=data.stim_dims,
+            stim_names=data.stim_names,
+            stim_baseline=data.baseline,
+            stim_scaling=data.scaling,
+            stim_normalization=data.stim_normalization,
+            basis=data.basis,
+            tstart=data.tstart,
+            tstep=data.tstep,
+            tstop=data.tstop,
+            basis_std=data.basis_std,
+        )
+
+    def __repr__(self) -> str:
+        orientation = 'free' if self.forward.space else 'fixed'
+        return f"<[{orientation} orientation] {self._name} on {self.forward.source!r}>"
+
+    def _whiten(self, data: RegressionData) -> RegressionData:
+        """Whiten ``data`` unless it is already whitened (no-op for fitted/CV data)."""
+        if data.is_whitened:
+            return data
+        return data.whiten(self.forward.whitening_filter)
+
+    def _predict_whitened(self, covariate: FloatArray) -> FloatArray:
+        """Predicted whitened sensor data for one trial's covariate matrix."""
+        return np.dot(np.dot(self.forward.whitened_lead_field, self.theta), covariate.T)
+
     def eval_obj(
             self,
             data: RegressionData,
             return_wl2: bool = False,
     ) -> float | tuple[float, float]:
-        """Evaluate the current objective value on a dataset.
+        """Evaluate the model's objective value on a dataset.
 
         Parameters
         ----------
         data
             Dataset on which to evaluate the objective.
+        return_wl2
+            Also return the weighted L2 term.
 
         Returns
         -------
@@ -1042,61 +1239,35 @@ class _Solver:
             Objective value, or a pair containing the objective value and the
             weighted L2 term when ``return_wl2`` is true.
         """
-        ll2 = 0
-        logdet = 0
-        for key, (meg, covariate) in enumerate(data):
-            y = meg - np.dot(np.dot(self.forward.whitened_lead_field, self.theta), covariate.T)
-            Cb = np.dot(y, y.T)  # empirical data covariance
-            try:
-                yhat = linalg.cholesky(Cb, lower=True)
-            except np.linalg.LinAlgError:
-                hi = y.shape[0] - 1
-                lo = max(y.shape[0] - y.shape[1], 0)
-                e, v = linalg.eigh(Cb, subset_by_index=(lo, hi))
-                tol = e[-1] * _R_tol
-                indices = e > tol
-                yhat = v[:, indices] * np.sqrt(e[indices])
-
-            sigma_b = self.Sigma_b[key]
-            try:
-                Lc = linalg.cholesky(sigma_b, lower=True)
-                y = linalg.solve(Lc, yhat)
-                logdet_ = np.log(np.diag(Lc)).sum()
-            except np.linalg.LinAlgError:
-                Lc, e = _inv_sqrtm(sigma_b, return_eig=True)
-                y = np.dot(Lc, yhat)
-                logdet_ = -np.log(e).sum()
-
-            ll2 += 0.5 * (y ** 2).sum()
-            logdet += logdet_
-        if return_wl2:
-            return (ll2 + logdet) / len(data), ll2 / len(data)
-        return (ll2 + logdet) / len(data)
+        data = self._whiten(data)
+        return _evaluate_objective(self.forward, self.theta, self.Sigma_b, data, return_wl2)
 
     def eval_l2(self, data: RegressionData) -> float:
         """Evaluate the unweighted L2 prediction error used in CV."""
+        data = self._whiten(data)
         l2 = 0
         for key, (meg, covariate) in enumerate(data):
-            y = meg - np.dot(np.dot(self.forward.whitened_lead_field, self.theta), covariate.T)
+            y = meg - self._predict_whitened(covariate)
             l2 += 0.5 * (y ** 2).sum()
 
         return l2 / len(data)
 
-    def compute_explained_variance(self, data: RegressionData) -> float:
-        """Compute the global explained-variance score for a fitted model."""
+    def explained_variance(self, data: RegressionData) -> float:
+        """Compute the global explained-variance score on a dataset."""
         logger = logging.getLogger('NCRF: Explained Variance')
+        data = self._whiten(data)
         temp = 0
         for key, (meg, covariate) in enumerate(data):
             W_meg = meg
-            W_leadfield = self.forward.whitened_lead_field
-            y = W_meg - np.dot(np.dot(W_leadfield, self.theta), covariate.T)
+            y = W_meg - self._predict_whitened(covariate)
             temp += np.nansum(np.var(y, axis=1) / np.var(W_meg, axis=1)) / y.shape[0]
 
         logger.debug(f'{self.mu}: {1 - temp / len(data)}')
         return 1 - temp / len(data)
 
-    def _compute_voxelwise_explained_variance(self, data: RegressionData) -> FloatArray:
+    def voxelwise_explained_variance(self, data: RegressionData) -> NDVar:
         """Compute each source's contribution to explained variance."""
+        data = self._whiten(data)
         temp = np.zeros(len(self.forward.source))
         theta = self.theta.copy()
         for key, (meg, covariate) in enumerate(data):
@@ -1114,37 +1285,10 @@ class _Solver:
                 y = W_meg - np.dot(np.dot(W_leadfield, theta), covariate.T)
                 temp[i] += np.nansum((np.var(y, axis=1) - explained_variance) / total_var) / W_meg.shape[0]
 
-        return temp / len(data)
-
-    def _auto_mu(self, data: RegressionData, p: float = 99.0) -> FloatArray:
-        """Infer a candidate regularization grid from the gradient magnitudes."""
-        self._set_mu(0.0, data)
-        _, grad_funct = self._construct_f(data)
-        if self.forward.space:
-            x = grad_funct(self.theta)
-            l = x.shape[1]
-            x.shape = (-1, 3, l)
-            norm = np.linalg.norm(x, axis=1)
-        else:
-            x = grad_funct(self.theta)
-            norm = np.abs(x)
-
-        hi = log10(np.percentile(norm, p))
-        lo = hi - 2
-        return np.logspace(lo, hi, 7)
+        return NDVar(temp / len(data), self.forward.source)
 
     @staticmethod
-    def _residual(theta0: FloatArray, theta1: FloatArray) -> float:
-        diff = theta1 - theta0
-        num = diff ** 2
-        den = theta0 ** 2
-        if den.sum() <= 0:
-            return np.inf
-        else:
-            return sqrt(num.sum() / den.sum())
-
-    @staticmethod
-    def compute_ES_metric(models: Sequence[_Solver], data: RegressionData) -> float:
+    def compute_es_metric(models: Sequence[NCRFModel], data: RegressionData) -> float:
         """Compute the estimation-stability metric across cross-validation folds.
 
         Details can be found at:
@@ -1154,7 +1298,7 @@ class _Solver:
         Parameters
         ----------
         models
-            Fitted fold solvers from cross-validation.
+            Fitted fold models from cross-validation.
         data
             Dataset used to compare their predictions.
 
@@ -1167,7 +1311,7 @@ class _Solver:
         for model in models:
             y = np.empty(0)
             for trial in range(len(data)):
-                y = np.append(y, np.dot(np.dot(model.forward.whitened_lead_field, model.theta), data.covariates[trial].T))
+                y = np.append(y, model._predict_whitened(data.covariates[trial]))
             Y.append(y)
         Y = np.array(Y)
         Y_bar = Y.mean(axis=0)
@@ -1176,6 +1320,62 @@ class _Solver:
             return np.inf
         else:
             return VarY / (Y_bar ** 2).sum()
+
+    @cached_property
+    def h_scaled(self) -> NDVar | list[NDVar]:
+        """Return ``h`` with the original stimulus scaling restored."""
+        if self._stim_scaling is None:
+            return self.h
+        elif self._stim_is_single:
+            return self.h * self._stim_scaling[0]
+        else:
+            return [h * s for h, s in zip(self.h, self._stim_scaling)]
+
+    @cached_property
+    def h(self) -> NDVar | list[NDVar]:
+        """Return the spatio-temporal response function as Eelbrain NDVars."""
+        source = self.forward.source
+        space = self.forward.space
+        n_vars = sum(len(dim) if dim else 1 for dim in self._stim_dims)
+        if space:
+            _shared_dims = (source, space)
+        else:
+            _shared_dims = (source, )
+
+        if n_vars > 1:
+            _trf = []
+            start = 0
+            stop = 0
+            for basis, dim in zip(self._basis, self._stim_dims):
+                stim_len = len(dim) if dim else 1
+                stop += basis.shape[1] * stim_len
+                theta = self.theta[:, start:stop].copy()
+                shape = (self.theta.shape[0], stim_len, -1)
+                theta = theta.reshape(shape)
+                _trf.append(np.squeeze(theta.swapaxes(1, 0)))
+                start += basis.shape[1] * stim_len
+        else:
+            _trf = [self.theta]
+
+        trf = [np.dot(x, basis.T) / self.forward.lead_field_scaling for x, basis in zip(_trf, self._basis)]
+
+        h = []
+        for x, dim, name, tstart in zip(trf, self._stim_dims, self._stim_names, self.tstart):
+            if dim:
+                time = UTS(tstart, self.tstep, x.shape[-1])
+                shared_dims = (*_shared_dims, time)
+                x = x.reshape((-1, *(map(len, shared_dims))))
+                dims = (dim, *shared_dims)
+            else:
+                time = UTS(tstart, self.tstep, x.shape[-1])
+                dims = (*_shared_dims, time)
+                x = x.reshape(*(map(len, dims)))
+            h.append(NDVar(x, dims, name=name))
+
+        if self._stim_is_single:
+            return h[0]
+        else:
+            return h
 
 
 class NCRF:
@@ -1228,8 +1428,8 @@ class NCRF:
         orientation = 'free' if self.forward.space else 'fixed'
         return f"<[{orientation} orientation] {self._name} on {self.forward.source!r}>"
 
-    def _new_solver(self) -> _Solver:
-        return _Solver(self.forward, self.n_iter, self.n_iterc, self.n_iterf)
+    def _new_solver(self) -> Solver:
+        return Solver(self.forward, self.n_iter, self.n_iterc, self.n_iterf)
 
     def fit(
             self,
@@ -1308,15 +1508,19 @@ class NCRF:
 
         solver = self._new_solver()
         solver.run(data, mu, tol, history, verbose)
+        model = NCRFModel._from_solver(solver, data)
 
-        residual = solver.eval_obj(data)
-        explained_var = solver.compute_explained_variance(data)
+        residual = model.eval_obj(data)
+        explained_var = model.explained_variance(data)
         if compute_explained_variance:
-            voxelwise = solver._compute_voxelwise_explained_variance(data)
+            voxelwise = model.voxelwise_explained_variance(data)
         else:
             voxelwise = None
 
-        return NCRFResult._from_fit(solver, data, history, cv_results, residual, explained_var, voxelwise)
+        return NCRFResult(
+            model, explained_var=explained_var, voxelwise_explained_variance=voxelwise,
+            residual=residual, history=history, cv_results=cv_results,
+        )
 
     def _select_mu(
             self,
@@ -1341,9 +1545,7 @@ class NCRF:
             return mu, None
 
         if mus == 'auto':
-            grid_solver = self._new_solver()
-            grid_solver._init_from_mne(data)
-            mus = grid_solver._auto_mu(data)
+            mus = find_mu_range(self._new_solver().gradient(data))
         logger.info('Crossvalidation initiated!')
         cv_results = crossvalidate(self, data, mus, tol, n_splits, n_workers)
         best_cv = min(cv_results, key=attrgetter('cross_fit'))
@@ -1358,8 +1560,8 @@ class NCRF:
 
         if new_mus is not None:
             cv_results.extend(crossvalidate(self, data, new_mus, tol, n_splits, n_workers))
+            best_cv = min(cv_results, key=attrgetter('cross_fit'))
 
-        best_cv = min(cv_results, key=attrgetter('cross_fit'))
         mu = best_cv.mu
         if use_ES:
             cv_results_ = sorted(cv_results, key=attrgetter('mu'))
@@ -1396,7 +1598,7 @@ class NCRF:
 
         In the cross-validation phase the workers call this function for
         different regularizer parameters.  Each fold is an independent
-        :class:`_Solver` built from the shared forward model.
+        :class:`Solver` built from the shared forward model.
 
         Parameters
         ----------
@@ -1415,28 +1617,31 @@ class NCRF:
             cross-validation metrics.
         """
         from ._crossvalidation import TimeSeriesSplit
-        solvers = [self._new_solver() for _ in range(n_splits)]
 
         def cvfunc(mu: float) -> CVResult:
             d = max(basis.shape[1] for basis in data.basis)
             kf = TimeSeriesSplit(r=0.05, p=n_splits, d=d)
+            models = []
             ll = []
             ll1 = []
             ll2 = []
-            for solver, (train, test) in zip(solvers, kf.split(data.meg[0][0])):
+            for (train, test) in kf.split(data.meg[0][0]):
                 traindata = data.timeslice(train)
                 testdata = data.timeslice(test)
+                solver = self._new_solver()
                 solver.run(traindata, mu, tol, FitHistory(store_objective=False, store_residual=False))
-                obj, wl2 = solver.eval_obj(testdata, True)
+                model = NCRFModel._from_solver(solver, data)
+                models.append(model)
+                obj, wl2 = model.eval_obj(testdata, True)
                 ll.append(wl2)
                 ll1.append(obj)
-                ll2.append(solver.eval_l2(testdata))
+                ll2.append(model.eval_l2(testdata))
 
             time.sleep(0.001)
             return CVResult(
                 mu,
                 sum(ll) / len(ll),  # weighted_l2_error
-                _Solver.compute_ES_metric(solvers, data),  # estimation_stability
+                NCRFModel.compute_es_metric(models, data),  # estimation_stability
                 sum(ll1) / len(ll1),  # cross_fit
                 sum(ll2) / len(ll2),  # l2_error
             )
@@ -1445,198 +1650,50 @@ class NCRF:
 
 
 class NCRFResult:
-    """Fitted neuro-current response functions produced by :meth:`NCRF.fit`.
+    """Report produced by :meth:`NCRF.fit`.
+
+    Bundles the fitted :class:`NCRFModel` with the training-set evaluation and the
+    fitting provenance.  Model-level quantities (``h``, ``theta``, ``mu``, …) live
+    on :attr:`model`; this object holds only what is specific to *this* fit.
 
     Attributes
     ----------
-    h
-        The neuro-current response function. It is one NDVar when fitting a single
-        predictor and a sequence of NDVars when fitting multiple predictors.
-    h_scaled
-        ``h`` with the original stimulus scaling restored.
+    model
+        The fitted :class:`NCRFModel` (frozen weights + prediction/evaluation API).
     explained_var
-        Fraction of total variance explained by the fitted NCRFs.
+        Fraction of total variance explained, evaluated on the training data. For
+        an arbitrary dataset use :meth:`model.explained_variance`.
     voxelwise_explained_variance
-        Source-wise contributions to explained variance.
-    Gamma
-        Individual source covariance matrices.
-    Sigma_b
-        Data covariance estimates under the model.
-    theta
-        NCRF coefficients over the Gabor basis.
-    mu
-        Regularization parameter used for the fitted model.
+        Source-wise contributions to explained variance on the training data
+        (``None`` unless requested at fit time).
     residual
-        The fit error, i.e. the result of the ``eval_obj`` error function on the
-        final fit.
+        The fit error, i.e. ``model.eval_obj`` on the training data.
     history
         Per-iteration :class:`FitHistory` accumulated during fitting.
-    tstart
-        TRF start time in seconds, one value per predictor.
-    tstep
-        Sample spacing in seconds.
-    tstop
-        TRF stop time in seconds, one value per predictor.
-    basis_std
-        Standard deviation of the Gaussian basis functions in seconds.
     """
     _name = 'cTRFs estimator'
 
     def __init__(
             self,
+            model: NCRFModel,
             *,
-            theta: FloatArray,
-            mu: float,
-            Gamma: list,
-            Sigma_b: list,
-            residual: float,
             explained_var: float,
-            voxelwise_explained_variance: FloatArray | None,
+            voxelwise_explained_variance: NDVar | None,
+            residual: float,
             history: FitHistory,
             cv_results: list[CVResult] | None,
-            source,
-            space: Space | None,
-            lead_field_scaling: float,
-            stim_is_single: bool,
-            stim_dims: list,
-            stim_names: list[str],
-            stim_baseline,
-            stim_scaling,
-            stim_normalization: list,
-            basis: list[FloatArray],
-            tstart: list[float],
-            tstep: float,
-            tstop: list[float],
-            basis_std: float,
     ) -> None:
-        self.theta = theta
-        self.mu = mu
-        self.Gamma = Gamma
-        self.Sigma_b = Sigma_b
-        self.residual = residual
+        self.model = model
         self.explained_var = explained_var
-        self._voxelwise_explained_variance = voxelwise_explained_variance
+        self.voxelwise_explained_variance = voxelwise_explained_variance
+        self.residual = residual
         self.history = history
         self._cv_results = cv_results
-        self.source = source
-        self.space = space
-        self.lead_field_scaling = lead_field_scaling
-        self._stim_is_single = stim_is_single
-        self._stim_dims = stim_dims
-        self._stim_names = stim_names
-        self._stim_baseline = stim_baseline
-        self._stim_scaling = stim_scaling
-        self._stim_normalization = stim_normalization
-        self._basis = basis
-        self.tstart = tstart
-        self.tstep = tstep
-        self.tstop = tstop
-        self.basis_std = basis_std
-
-    @classmethod
-    def _from_fit(
-            cls,
-            solver: _Solver,
-            data: RegressionData,
-            history: FitHistory,
-            cv_results: list[CVResult] | None,
-            residual: float,
-            explained_var: float,
-            voxelwise: FloatArray | None,
-    ) -> NCRFResult:
-        """Assemble a result from a finished solver and the fitted data's metadata."""
-        forward = solver.forward
-        return cls(
-            theta=solver.theta,
-            mu=solver.mu,
-            Gamma=solver.Gamma,
-            Sigma_b=solver.Sigma_b,
-            residual=residual,
-            explained_var=explained_var,
-            voxelwise_explained_variance=voxelwise,
-            history=history,
-            cv_results=cv_results,
-            source=forward.source,
-            space=forward.space,
-            lead_field_scaling=forward.lead_field_scaling,
-            stim_is_single=data.stim_is_single,
-            stim_dims=data.stim_dims,
-            stim_names=data.stim_names,
-            stim_baseline=data.baseline,
-            stim_scaling=data.scaling,
-            stim_normalization=data.stim_normalization,
-            basis=data.basis,
-            tstart=data.tstart,
-            tstep=data.tstep,
-            tstop=data.tstop,
-            basis_std=data.basis_std,
-        )
 
     def __repr__(self) -> str:
-        orientation = 'free' if self.space else 'fixed'
-        return f"<[{orientation} orientation] {self._name} on {self.source!r}>"
-
-    @cached_property
-    def voxelwise_explained_variance(self) -> NDVar | None:
-        """Voxelwise explained variance expressed on the source dimension."""
-        if self._voxelwise_explained_variance is None:
-            return None
-        else:
-            return NDVar(self._voxelwise_explained_variance, self.source)
-
-    @cached_property
-    def h_scaled(self) -> NDVar | list[NDVar]:
-        """Return ``h`` with the original stimulus scaling restored."""
-        if self._stim_scaling is None:
-            return self.h
-        elif self._stim_is_single:
-            return self.h * self._stim_scaling[0]
-        else:
-            return [h * s for h, s in zip(self.h, self._stim_scaling)]
-
-    @cached_property
-    def h(self) -> NDVar | list[NDVar]:
-        """Return the spatio-temporal response function as Eelbrain NDVars."""
-        n_vars = sum(len(dim) if dim else 1 for dim in self._stim_dims)
-        if self.space:
-            _shared_dims = (self.source, self.space)
-        else:
-            _shared_dims = (self.source, )
-
-        if n_vars > 1:
-            _trf = []
-            start = 0
-            stop = 0
-            for basis, dim in zip(self._basis, self._stim_dims):
-                stim_len = len(dim) if dim else 1
-                stop += basis.shape[1] * stim_len
-                theta = self.theta[:, start:stop].copy()
-                shape = (self.theta.shape[0], stim_len, -1)
-                theta = theta.reshape(shape)
-                _trf.append(np.squeeze(theta.swapaxes(1, 0)))
-                start += basis.shape[1] * stim_len
-        else:
-            _trf = [self.theta]
-
-        trf = [np.dot(x, basis.T) / self.lead_field_scaling for x, basis in zip(_trf, self._basis)]
-
-        h = []
-        for x, dim, name, tstart in zip(trf, self._stim_dims, self._stim_names, self.tstart):
-            if dim:
-                time = UTS(tstart, self.tstep, x.shape[-1])
-                shared_dims = (*_shared_dims, time)
-                x = x.reshape((-1, *(map(len, shared_dims))))
-                dims = (dim, *shared_dims)
-            else:
-                time = UTS(tstart, self.tstep, x.shape[-1])
-                dims = (*_shared_dims, time)
-                x = x.reshape(*(map(len, dims)))
-            h.append(NDVar(x, dims, name=name))
-
-        if self._stim_is_single:
-            return h[0]
-        else:
-            return h
+        forward = self.model.forward
+        orientation = 'free' if forward.space else 'fixed'
+        return f"<[{orientation} orientation] {self._name} on {forward.source!r}>"
 
     def cv_info(self) -> fmtxt.Table:
         """Summarize stored cross-validation scores in a table."""
@@ -1661,7 +1718,7 @@ class NCRFResult:
         # warnings
         mus = [res.mu for res in self._cv_results]
         warnings = []
-        if self.mu == min(mus):
+        if self.model.mu == min(mus):
             warnings.append("Best mu is smallest mu")
         if warnings:
             table.caption(f"Warnings: {'; '.join(warnings)}")
