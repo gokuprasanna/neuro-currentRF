@@ -15,13 +15,14 @@ from functools import cached_property
 from operator import attrgetter
 from typing import Sequence
 
-from eelbrain import NDVar, UTS, fmtxt
+from eelbrain import NDVar, fmtxt
 import numpy as np
 from scipy.signal import find_peaks
 
 from ._crossvalidation import CVResult, crossvalidate
 from ._data import RegressionData
 from ._forward import ForwardModel
+from ._reconstruction import TRFDesign
 from ._solver import FitHistory, Solver, _evaluate_objective, find_mu_range
 from ._typing import FloatArray, MuArg, MusArg
 
@@ -75,16 +76,28 @@ class NCRFModel:
         self.Gamma = Gamma
         self.Sigma_b = Sigma_b
         self.mu = mu
-        self._stim_is_single = stim_is_single
-        self._stim_dims = stim_dims
-        self._stim_names = stim_names
-        self._stim_baseline = stim_baseline
-        self._stim_scaling = stim_scaling
-        self._basis = basis
-        self.tstart = tstart
-        self.tstep = tstep
-        self.tstop = tstop
-        self.basis_std = basis_std
+        self._design = TRFDesign(
+            basis=basis,
+            tstart=tstart, tstep=tstep, tstop=tstop, basis_std=basis_std,
+            stim_is_single=stim_is_single, stim_dims=stim_dims, stim_names=stim_names,
+            stim_baseline=stim_baseline, stim_scaling=stim_scaling,
+        )
+
+    @property
+    def tstart(self) -> list[float]:
+        return self._design.tstart
+
+    @property
+    def tstep(self) -> float:
+        return self._design.tstep
+
+    @property
+    def tstop(self) -> list[float]:
+        return self._design.tstop
+
+    @property
+    def basis_std(self) -> float:
+        return self._design.basis_std
 
     @classmethod
     def _from_solver(cls, solver: Solver, data: RegressionData) -> NCRFModel:
@@ -223,58 +236,12 @@ class NCRFModel:
     @cached_property
     def h_scaled(self) -> NDVar | list[NDVar]:
         """Return ``h`` with the original stimulus scaling restored."""
-        if self._stim_scaling is None:
-            return self.h
-        elif self._stim_is_single:
-            return self.h * self._stim_scaling[0]
-        else:
-            return [h * s for h, s in zip(self.h, self._stim_scaling)]
+        return self._design.reconstruct_scaled(self.h)
 
     @cached_property
     def h(self) -> NDVar | list[NDVar]:
         """Return the spatio-temporal response function as Eelbrain NDVars."""
-        source = self.forward.source
-        space = self.forward.space
-        n_vars = sum(len(dim) if dim else 1 for dim in self._stim_dims)
-        if space:
-            _shared_dims = (source, space)
-        else:
-            _shared_dims = (source, )
-
-        if n_vars > 1:
-            _trf = []
-            start = 0
-            stop = 0
-            for basis, dim in zip(self._basis, self._stim_dims):
-                stim_len = len(dim) if dim else 1
-                stop += basis.shape[1] * stim_len
-                theta = self.theta[:, start:stop].copy()
-                shape = (self.theta.shape[0], stim_len, -1)
-                theta = theta.reshape(shape)
-                _trf.append(np.squeeze(theta.swapaxes(1, 0)))
-                start += basis.shape[1] * stim_len
-        else:
-            _trf = [self.theta]
-
-        trf = [np.dot(x, basis.T) / self.forward.lead_field_scaling for x, basis in zip(_trf, self._basis)]
-
-        h = []
-        for x, dim, name, tstart in zip(trf, self._stim_dims, self._stim_names, self.tstart):
-            if dim:
-                time = UTS(tstart, self.tstep, x.shape[-1])
-                shared_dims = (*_shared_dims, time)
-                x = x.reshape((-1, *(map(len, shared_dims))))
-                dims = (dim, *shared_dims)
-            else:
-                time = UTS(tstart, self.tstep, x.shape[-1])
-                dims = (*_shared_dims, time)
-                x = x.reshape(*(map(len, dims)))
-            h.append(NDVar(x, dims, name=name))
-
-        if self._stim_is_single:
-            return h[0]
-        else:
-            return h
+        return self._design.reconstruct(self.theta, self.forward)
 
 
 class NCRF:

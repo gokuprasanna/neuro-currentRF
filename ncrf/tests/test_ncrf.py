@@ -31,8 +31,8 @@ def test_ncrf():
     np.testing.assert_allclose(result.residual, 178.512, rtol=0.001)
     # check scaling
     stim_baseline = stim.mean()
-    np.testing.assert_equal(result.model._stim_baseline[0], stim_baseline)
-    np.testing.assert_equal(result.model._stim_scaling[0], (stim - stim_baseline).abs().mean())
+    np.testing.assert_equal(result.model._design.stim_baseline[0], stim_baseline)
+    np.testing.assert_equal(result.model._design.stim_scaling[0], (stim - stim_baseline).abs().mean())
     np.testing.assert_allclose(result.model.h.norm('time').norm('source').norm('space'), 6.601677e-10, rtol=0.001)
 
     # test persistence
@@ -56,8 +56,8 @@ def test_ncrf():
     result = fit_ncrf(meg, [stim, stim2], fwd, emptyroom, tstop=[0.2, 0.2], normalize='l2', mu=0.0019444, n_iter=3,
                       n_iterc=3, n_iterf=10, do_post_normalization=False)
     # check scaling
-    np.testing.assert_equal(result.model._stim_baseline[0], stim.mean())
-    np.testing.assert_equal(result.model._stim_scaling[0], stim.std())
+    np.testing.assert_equal(result.model._design.stim_baseline[0], stim.mean())
+    np.testing.assert_equal(result.model._design.stim_scaling[0], stim.std())
     np.testing.assert_allclose(result.model.h[0].norm('time').norm('source').norm('space'), 7.0088e-10, rtol=0.001)
 
     # 2 stimuli, different tstarts (-ve)
@@ -75,8 +75,8 @@ def test_ncrf():
     np.testing.assert_equal(result.model.tstart, tstart)
     np.testing.assert_equal(result.model.tstop, tstop)
     # check scaling
-    np.testing.assert_equal(result.model._stim_baseline[0], stim.mean())
-    np.testing.assert_equal(result.model._stim_scaling[0], stim.std())
+    np.testing.assert_equal(result.model._design.stim_baseline[0], stim.mean())
+    np.testing.assert_equal(result.model._design.stim_scaling[0], stim.std())
     np.testing.assert_allclose(result.model.h[0].norm('time').norm('source').norm('space'), 6.6065539e-10, rtol=0.001)
 
     # cross-validation
