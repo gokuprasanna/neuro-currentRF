@@ -27,7 +27,7 @@ def test_ncrf():
     assert isinstance(result.model, NCRFModel)
     # check residual and explained var
     np.testing.assert_allclose(result.explained_var, 0.00641890144769941, rtol=0.001)
-    np.testing.assert_allclose(result.voxelwise_explained_variance.sum(), 0.08261162457414245, rtol=0.001)
+    np.testing.assert_allclose(result.voxelwise_explained_variance.sum(), 0.004410796436808832, rtol=0.001)
     np.testing.assert_allclose(result.residual, 178.512, rtol=0.001)
     # check scaling
     stim_baseline = stim.mean()

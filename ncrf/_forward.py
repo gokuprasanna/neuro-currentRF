@@ -66,6 +66,11 @@ class ForwardModel:
         """Number of orientation components per source."""
         return len(self.space) if self.space else 1
 
+    def source_block(self, i: int) -> slice:
+        """Column/row slice of source ``i``'s orientation components in stacked arrays."""
+        dc = self.dc
+        return slice(i * dc, (i + 1) * dc)
+
     def _prewhiten(self) -> None:
         """Compute whitened derived quantities from ``lead_field`` and ``noise_covariance``.
 

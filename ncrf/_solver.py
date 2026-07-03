@@ -278,11 +278,12 @@ class Solver:
                 sigma_b[:] = self.forward.whitened_noise_covariance[:]
 
                 for i in range(len(self.forward.source)):
+                    block = self.forward.source_block(i)
                     if dc > 1:
                         # update Xi
-                        x = np.dot(gamma[i], np.dot(lhat[:, i * dc:(i + 1) * dc].T, ytilde))
+                        x = np.dot(gamma[i], np.dot(lhat[:, block].T, ytilde))
                         # update Zi
-                        z = np.dot(lhat[:, i * dc:(i + 1) * dc].T, lhat[:, i * dc:(i + 1) * dc])
+                        z = np.dot(lhat[:, block].T, lhat[:, block])
                     else:
                         # update Xi
                         x = gamma[i] * lhat[:, i].T.dot(ytilde)
@@ -293,8 +294,8 @@ class Solver:
                     gamma[i] = compute_gamma(z, x, dc)
 
                     # update sigma_b for next iteration
-                    sigma_b += np.dot(self.forward.whitened_lead_field[:, i * dc:(i + 1) * dc],
-                                      np.dot(gamma[i], self.forward.whitened_lead_field[:, i * dc:(i + 1) * dc].T))
+                    lead_block = self.forward.whitened_lead_field[:, block]
+                    sigma_b += np.dot(lead_block, np.dot(gamma[i], lead_block.T))
 
             self.Gamma[key] = gamma
             self.Sigma_b[key] = sigma_b

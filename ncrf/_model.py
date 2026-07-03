@@ -170,22 +170,19 @@ class NCRFModel:
     def voxelwise_explained_variance(self, data: RegressionData) -> NDVar:
         """Compute each source's contribution to explained variance."""
         data = self._whiten(data)
+        W_leadfield = self.forward.whitened_lead_field
         temp = np.zeros(len(self.forward.source))
-        theta = self.theta.copy()
-        for key, (meg, covariate) in enumerate(data):
-            W_meg = meg
-            W_leadfield = self.forward.whitened_lead_field
-            total_var = np.var(W_meg, axis=1)
-            y = W_meg - np.dot(np.dot(W_leadfield, theta), covariate.T)
-            explained_variance = np.var(y, axis=1)
-            for i, _ in enumerate(self.forward.source):
-                theta[:] = self.theta[:]
-                if self.forward.space is None:
-                    theta[i] = 0
-                else:
-                    theta[i * len(self.forward.space):(i + 1) * len(self.forward.space)] = 0
-                y = W_meg - np.dot(np.dot(W_leadfield, theta), covariate.T)
-                temp[i] += np.nansum((np.var(y, axis=1) - explained_variance) / total_var) / W_meg.shape[0]
+        for meg, covariate in data:
+            total_var = np.var(meg, axis=1)
+            y_full = meg - np.dot(np.dot(W_leadfield, self.theta), covariate.T)
+            base_var = np.var(y_full, axis=1)
+            for i in range(len(self.forward.source)):
+                # Zeroing source i's weights just removes its (linear) contribution
+                # to the prediction, so add that contribution back to the residual.
+                block = self.forward.source_block(i)
+                contribution = np.dot(np.dot(W_leadfield[:, block], self.theta[block]), covariate.T)
+                y_i = y_full + contribution
+                temp[i] += np.nansum((np.var(y_i, axis=1) - base_var) / total_var) / meg.shape[0]
 
         return NDVar(temp / len(data), self.forward.source)
 
