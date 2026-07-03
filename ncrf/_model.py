@@ -25,6 +25,12 @@ from ._solver import FitHistory, Solver, _evaluate_objective
 from ._typing import FloatArray, MuArg, MusArg
 
 
+def _orientation_repr(name: str, forward: ForwardModel) -> str:
+    """Shared ``repr`` for the estimator/model/result trio."""
+    orientation = 'free' if forward.space else 'fixed'
+    return f"<[{orientation} orientation] {name} on {forward.source!r}>"
+
+
 class NCRFModel:
     """Frozen, fitted NCRF model that can be applied to arbitrary datasets.
 
@@ -96,8 +102,7 @@ class NCRFModel:
         )
 
     def __repr__(self) -> str:
-        orientation = 'free' if self.forward.space else 'fixed'
-        return f"<[{orientation} orientation] {self._name} on {self.forward.source!r}>"
+        return _orientation_repr(self._name, self.forward)
 
     def _whiten(self, data: RegressionData) -> RegressionData:
         """Whiten ``data`` unless it is already whitened (no-op for fitted/CV data)."""
@@ -134,13 +139,12 @@ class NCRFModel:
 
     def explained_variance(self, data: RegressionData) -> float:
         """Compute the global explained-variance score on a dataset."""
-        logger = logging.getLogger('NCRF: Explained Variance')
+        logger = logging.getLogger(__name__)
         data = self._whiten(data)
         temp = 0
-        for key, (meg, covariate) in enumerate(data):
-            W_meg = meg
-            y = W_meg - self._predict_whitened(covariate)
-            temp += np.nansum(np.var(y, axis=1) / np.var(W_meg, axis=1)) / y.shape[0]
+        for meg, covariate in data:
+            y = meg - self._predict_whitened(covariate)
+            temp += np.nansum(np.var(y, axis=1) / np.var(meg, axis=1)) / y.shape[0]
 
         logger.debug(f'{self.mu}: {1 - temp / len(data)}')
         return 1 - temp / len(data)
@@ -222,8 +226,7 @@ class NCRF:
         self.n_iterf = n_iterf
 
     def __repr__(self) -> str:
-        orientation = 'free' if self.forward.space else 'fixed'
-        return f"<[{orientation} orientation] {self._name} on {self.forward.source!r}>"
+        return _orientation_repr(self._name, self.forward)
 
     def _new_solver(self) -> Solver:
         return Solver(self.forward, self.n_iter, self.n_iterc, self.n_iterf)
@@ -384,9 +387,7 @@ class NCRFResult:
         self._cv_results = cv_results
 
     def __repr__(self) -> str:
-        forward = self.model.forward
-        orientation = 'free' if forward.space else 'fixed'
-        return f"<[{orientation} orientation] {self._name} on {forward.source!r}>"
+        return _orientation_repr(self._name, self.model.forward)
 
     def cv_info(self) -> fmtxt.Table:
         """Summarize stored cross-validation scores in a table."""
