@@ -18,7 +18,8 @@ from eelbrain import NDVar, Sensor
 import mne
 import numpy as np
 
-from ._model import NCRF, NCRFResult, RegressionData
+from ._data import RegressionData
+from ._model import NCRF, NCRFResult
 
 
 DEFAULT_MUs = np.logspace(-3, -1, 7)

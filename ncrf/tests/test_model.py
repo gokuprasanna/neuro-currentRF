@@ -4,7 +4,8 @@
 # License: BSD (3-clause)
 import numpy as np
 
-from ncrf._model import covariate_from_stim, gaussian_basis
+from ncrf._data import covariate_from_stim
+from ncrf._linalg import gaussian_basis
 from .fetch import load
 
 from eelbrain import Categorial, concatenate

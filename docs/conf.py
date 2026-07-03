@@ -88,7 +88,7 @@ napoleon_use_rtype = True
 
 qualname_overrides = {
     "ncrf._model.NCRF": "ncrf.NCRF",
-    "ncrf._model.RegressionData": "ncrf.RegressionData",
+    "ncrf._data.RegressionData": "ncrf.RegressionData",
     "ncrf._ncrf.fit_ncrf": "ncrf.fit_ncrf",
 }
 
