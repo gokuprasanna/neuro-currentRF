@@ -6,6 +6,7 @@ per-source covariance updates used by the Champagne iterations.
 from __future__ import annotations
 
 import logging
+from math import sqrt
 
 import numpy as np
 import numpy.typing as npt
@@ -130,3 +131,21 @@ def _compute_gamma_ip(z: FloatArray, x: FloatArray, gamma: FloatArray) -> None:
     a = np.dot(x, x.T)
     compute_gamma_c(z, a, gamma)
     return
+
+
+def compute_gamma(z: FloatArray, x: FloatArray, dc: int) -> FloatArray | float:
+    """Return the updated source-block covariance for one Champagne step.
+
+    Wraps the per-orientation update paths behind a single return-value
+    interface: a scalar for fixed orientation (``dc == 1``), the Cython kernel
+    for the three-component free-orientation case (``dc == 3``), and the general
+    eigendecomposition otherwise.
+    """
+    if dc == 1:
+        return sqrt((x ** 2).sum()) / np.real(sqrt(z))
+    elif dc == 3:
+        gamma = np.empty((3, 3))
+        _compute_gamma_ip(z, x, gamma)
+        return gamma
+    else:
+        return _compute_gamma_i(z, x)

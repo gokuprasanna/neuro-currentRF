@@ -21,7 +21,7 @@ from ._fastac import Fasta
 from ._data import RegressionData
 from ._forward import ForwardModel
 from ._initialization import mne_initialization
-from ._linalg import _compute_gamma_i, _compute_gamma_ip, _inv_sqrtm
+from ._linalg import _inv_sqrtm, compute_gamma
 from ._penalties import g, g_group, proxg_group_opt, shrink
 from ._typing import _R_tol, FloatArray, GradientFunction, ObjectiveFunction
 
@@ -290,12 +290,7 @@ class Solver:
                         z = (lhat[:, i] ** 2).sum()
 
                     # update Ti
-                    if dc == 1:
-                        gamma[i] = sqrt((x ** 2).sum()) / np.real(sqrt(z))
-                    elif dc == 3:
-                        _compute_gamma_ip(z, x, gamma[i])
-                    else:
-                        gamma[i] = _compute_gamma_i(z, x)
+                    gamma[i] = compute_gamma(z, x, dc)
 
                     # update sigma_b for next iteration
                     sigma_b += np.dot(self.forward.whitened_lead_field[:, i * dc:(i + 1) * dc],
