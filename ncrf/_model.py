@@ -64,7 +64,6 @@ class NCRFModel:
             stim_names: list[str],
             stim_baseline,
             stim_scaling,
-            stim_normalization: list,
             basis: list[FloatArray],
             tstart: list[float],
             tstep: float,
@@ -81,7 +80,6 @@ class NCRFModel:
         self._stim_names = stim_names
         self._stim_baseline = stim_baseline
         self._stim_scaling = stim_scaling
-        self._stim_normalization = stim_normalization
         self._basis = basis
         self.tstart = tstart
         self.tstep = tstep
@@ -102,7 +100,6 @@ class NCRFModel:
             stim_names=data.stim_names,
             stim_baseline=data.baseline,
             stim_scaling=data.scaling,
-            stim_normalization=data.stim_normalization,
             basis=data.basis,
             tstart=data.tstart,
             tstep=data.tstep,
