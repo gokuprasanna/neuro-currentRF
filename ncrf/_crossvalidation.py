@@ -23,9 +23,53 @@ import numpy.typing as npt
 from tqdm import tqdm
 
 if TYPE_CHECKING:
-    from ._model import NCRF, RegressionData
+    from ._model import NCRF, NCRFModel, RegressionData
 
 FloatArray = npt.NDArray[np.float64]
+
+
+def eval_l2(model: NCRFModel, data: RegressionData) -> float:
+    """Unweighted L2 prediction error of a fitted model, used to score CV folds."""
+    data = model._whiten(data)
+    l2 = 0
+    for meg, covariate in data:
+        y = meg - model._predict_whitened(covariate)
+        l2 += 0.5 * (y ** 2).sum()
+    return l2 / len(data)
+
+
+def compute_es_metric(models: Sequence[NCRFModel], data: RegressionData) -> float:
+    """Compute the estimation-stability metric across cross-validation folds.
+
+    Details can be found at:
+    Lim, Chinghway, and Bin Yu. "Estimation stability with cross-validation (ESCV)."
+    Journal of Computational and Graphical Statistics 25.2 (2016): 464-492.
+
+    Parameters
+    ----------
+    models
+        Fitted fold models from cross-validation.
+    data
+        Dataset used to compare their predictions.
+
+    Returns
+    -------
+    float
+        Estimation-stability score.
+    """
+    Y = []
+    for model in models:
+        y = np.empty(0)
+        for trial in range(len(data)):
+            y = np.append(y, model._predict_whitened(data.covariates[trial]))
+        Y.append(y)
+    Y = np.array(Y)
+    Y_bar = Y.mean(axis=0)
+    VarY = (((Y - Y_bar) ** 2).sum(axis=1)).mean()
+    if (Y_bar ** 2).sum() <= 0:
+        return np.inf
+    else:
+        return VarY / (Y_bar ** 2).sum()
 
 
 class CVResult:
@@ -89,13 +133,13 @@ def _score_mu(
         obj, wl2 = model.eval_obj(testdata, True)
         weighted_l2.append(wl2)
         cross_fit.append(obj)
-        l2.append(model.eval_l2(testdata))
+        l2.append(eval_l2(model, testdata))
 
     time.sleep(0.001)
     return CVResult(
         mu,
         sum(weighted_l2) / len(weighted_l2),
-        NCRFModel.compute_es_metric(models, data),
+        compute_es_metric(models, data),
         sum(cross_fit) / len(cross_fit),
         sum(l2) / len(l2),
     )

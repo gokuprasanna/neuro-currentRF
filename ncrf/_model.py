@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 from functools import cached_property
 from operator import attrgetter
-from typing import Sequence
 
 from eelbrain import NDVar, fmtxt
 import numpy as np
@@ -157,16 +156,6 @@ class NCRFModel:
         data = self._whiten(data)
         return _evaluate_objective(self.forward, self.theta, self.Sigma_b, data, return_wl2)
 
-    def eval_l2(self, data: RegressionData) -> float:
-        """Evaluate the unweighted L2 prediction error used in CV."""
-        data = self._whiten(data)
-        l2 = 0
-        for key, (meg, covariate) in enumerate(data):
-            y = meg - self._predict_whitened(covariate)
-            l2 += 0.5 * (y ** 2).sum()
-
-        return l2 / len(data)
-
     def explained_variance(self, data: RegressionData) -> float:
         """Compute the global explained-variance score on a dataset."""
         logger = logging.getLogger('NCRF: Explained Variance')
@@ -198,40 +187,6 @@ class NCRFModel:
                 temp[i] += np.nansum((np.var(y_i, axis=1) - base_var) / total_var) / meg.shape[0]
 
         return NDVar(temp / len(data), self.forward.source)
-
-    @staticmethod
-    def compute_es_metric(models: Sequence[NCRFModel], data: RegressionData) -> float:
-        """Compute the estimation-stability metric across cross-validation folds.
-
-        Details can be found at:
-        Lim, Chinghway, and Bin Yu. "Estimation stability with cross-validation (ESCV)."
-        Journal of Computational and Graphical Statistics 25.2 (2016): 464-492.
-
-        Parameters
-        ----------
-        models
-            Fitted fold models from cross-validation.
-        data
-            Dataset used to compare their predictions.
-
-        Returns
-        -------
-        float
-            Estimation-stability score.
-        """
-        Y = []
-        for model in models:
-            y = np.empty(0)
-            for trial in range(len(data)):
-                y = np.append(y, model._predict_whitened(data.covariates[trial]))
-            Y.append(y)
-        Y = np.array(Y)
-        Y_bar = Y.mean(axis=0)
-        VarY = (((Y - Y_bar) ** 2).sum(axis=1)).mean()
-        if (Y_bar ** 2).sum() <= 0:
-            return np.inf
-        else:
-            return VarY / (Y_bar ** 2).sum()
 
     @cached_property
     def h_scaled(self) -> NDVar | list[NDVar]:
