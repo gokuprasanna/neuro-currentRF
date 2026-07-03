@@ -17,6 +17,7 @@ import numpy.typing as npt
 from scipy import linalg
 
 from ._linalg import gaussian_basis
+from ._reconstruction import TRFDesign
 from ._typing import FloatArray, IndexArray, StimDimensions, TrialData
 
 
@@ -367,6 +368,21 @@ class RegressionData:
 
     def __repr__(self) -> str:
         return 'Regression data'
+
+    @property
+    def trf_design(self) -> TRFDesign:
+        """Small, picklable metadata bundle needed to reconstruct response functions.
+
+        Stored on the fitted :class:`~ncrf._model.NCRFModel` (which persists to
+        disk) so that ``h`` can be reconstructed without keeping the full,
+        typically much larger, :class:`RegressionData`.
+        """
+        return TRFDesign(
+            basis=self.basis,
+            tstart=self.tstart, tstep=self.tstep, tstop=self.tstop, basis_std=self.basis_std,
+            stim_is_single=self.stim_is_single, stim_dims=self.stim_dims, stim_names=self.stim_names,
+            stim_baseline=self.baseline, stim_scaling=self.scaling,
+        )
 
     @cached_property
     def bbt(self) -> list[FloatArray]:

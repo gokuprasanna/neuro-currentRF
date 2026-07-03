@@ -59,28 +59,14 @@ class NCRFModel:
             Gamma: list,
             Sigma_b: list,
             mu: float,
-            stim_is_single: bool,
-            stim_dims: list,
-            stim_names: list[str],
-            stim_baseline,
-            stim_scaling,
-            basis: list[FloatArray],
-            tstart: list[float],
-            tstep: float,
-            tstop: list[float],
-            basis_std: float,
+            design: TRFDesign,
     ) -> None:
         self.forward = forward
         self.theta = theta
         self.Gamma = Gamma
         self.Sigma_b = Sigma_b
         self.mu = mu
-        self._design = TRFDesign(
-            basis=basis,
-            tstart=tstart, tstep=tstep, tstop=tstop, basis_std=basis_std,
-            stim_is_single=stim_is_single, stim_dims=stim_dims, stim_names=stim_names,
-            stim_baseline=stim_baseline, stim_scaling=stim_scaling,
-        )
+        self._design = design
 
     @property
     def tstart(self) -> list[float]:
@@ -107,16 +93,7 @@ class NCRFModel:
             Gamma=solver.Gamma,
             Sigma_b=solver.Sigma_b,
             mu=solver.mu,
-            stim_is_single=data.stim_is_single,
-            stim_dims=data.stim_dims,
-            stim_names=data.stim_names,
-            stim_baseline=data.baseline,
-            stim_scaling=data.scaling,
-            basis=data.basis,
-            tstart=data.tstart,
-            tstep=data.tstep,
-            tstop=data.tstop,
-            basis_std=data.basis_std,
+            design=data.trf_design,
         )
 
     def __repr__(self) -> str:
