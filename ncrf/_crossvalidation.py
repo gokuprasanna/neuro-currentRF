@@ -10,17 +10,22 @@ from __future__ import annotations
 # Author: Proloy Das <email:proloyd94@gmail.com>
 # License: BSD (3-clause)
 
+import logging
 import os
 import time
 from math import ceil
 from multiprocessing import Process, Queue
+from operator import attrgetter
 import queue
 from typing import TYPE_CHECKING, Iterator, List, Sequence
 
 from eelbrain._config import CONFIG
 import numpy as np
 import numpy.typing as npt
+from scipy.signal import find_peaks
 from tqdm import tqdm
+
+from ._solver import find_mu_range
 
 if TYPE_CHECKING:
     from ._model import NCRF, NCRFModel, RegressionData
@@ -253,6 +258,94 @@ def crossvalidate(
         worker.join()
 
     return results
+
+
+def select_best_mu(cv_results: List[CVResult], criterion: str = 'cross-fit') -> float:
+    """Pick the best ``mu`` from cross-validation results by the given criterion.
+
+    Parameters
+    ----------
+    cv_results
+        Results to choose from.
+    criterion
+        Criterion for best fit. Possible values:
+
+        - ``'cross-fit'``: The smallest cross-fit value (default)
+        - ``'l2'``: The smallest l2 error
+        - ``'l2/mu'``: The local minimum in the l2 error with smallest trf (largest mu)
+    """
+    if criterion == 'cross-fit':
+        return min(cv_results, key=attrgetter('cross_fit')).mu
+    elif criterion == 'l2':
+        return min(cv_results, key=attrgetter('l2_error')).mu
+    elif criterion == 'l2/mu':
+        results = sorted(cv_results, key=attrgetter('mu'))
+        peaks, _ = find_peaks([-result.l2_error for result in results])  # find local minima
+        if len(peaks) > 0:
+            # higher mu -> smaller trf
+            return max((results[peak] for peak in peaks), key=attrgetter('mu')).mu
+        return min(results, key=attrgetter('l2_error')).mu
+    else:
+        raise ValueError(f'criterion={criterion}')
+
+
+def select_mu(
+        estimator: NCRF,
+        data: RegressionData,
+        mus: Sequence[float] | str,
+        tol: float,
+        n_splits: int,
+        n_workers: int,
+        use_ES: bool,
+) -> tuple[float, List[CVResult]]:
+    """Cross-validate over ``mus`` and choose the regularization parameter.
+
+    Builds the search grid (from the data when ``mus == 'auto'``), extends it by a
+    decade if the best value lands on a boundary, and optionally refines the choice
+    with the estimation-stability criterion. Returns the chosen ``mu`` and all
+    :class:`CVResult`.
+    """
+    logger = logging.getLogger(__name__)
+    if mus == 'auto':
+        mus = find_mu_range(estimator._new_solver().gradient(data))
+    logger.info('Crossvalidation initiated!')
+    cv_results = crossvalidate(estimator, data, mus, tol, n_splits, n_workers)
+    best_mu = select_best_mu(cv_results, 'cross-fit')
+    if best_mu == min(mus):
+        logger.info(f'CVmu is {best_mu}: extending range of mu towards left')
+        new_mus = np.logspace(np.log10(best_mu) - 1, np.log10(best_mu), 4)[:-1]
+    elif best_mu == max(mus):
+        logger.info(f'CVmu is {best_mu}: extending range of mu towards right')
+        new_mus = np.logspace(np.log10(best_mu), np.log10(best_mu) + 1, 4)[1:]
+    else:
+        new_mus = None
+
+    if new_mus is not None:
+        cv_results.extend(crossvalidate(estimator, data, new_mus, tol, n_splits, n_workers))
+        best_mu = select_best_mu(cv_results, 'cross-fit')
+
+    mu = best_mu
+    if use_ES:
+        cv_results_ = sorted(cv_results, key=attrgetter('mu'))
+        if mu == cv_results[-1].mu:
+            logger.info(f'\nCVmu is {mu}: could not find mu based on estimation stability criterion\nContinuing with cross-validation only.')
+        else:
+            best_es = None
+            for i, res in enumerate(cv_results_):
+                if res.mu < mu:
+                    continue
+                else:
+                    try:
+                        if res.estimation_stability < cv_results_[i + 1].estimation_stability:
+                            best_es = res
+                            break
+                    except IndexError:
+                        best_es = None
+            if best_es is None:
+                logger.warning('\nNo ES minima found: could not find mu based on estimation stability criterion.\nContinuing with cross-validation only.')
+            else:
+                mu = best_es.mu
+    return mu, cv_results
 
 
 class TimeSeriesSplit:

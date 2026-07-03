@@ -16,13 +16,12 @@ from operator import attrgetter
 
 from eelbrain import NDVar, fmtxt
 import numpy as np
-from scipy.signal import find_peaks
 
-from ._crossvalidation import CVResult, crossvalidate
+from ._crossvalidation import CVResult, select_best_mu, select_mu
 from ._data import RegressionData
 from ._forward import ForwardModel
 from ._reconstruction import TRFDesign
-from ._solver import FitHistory, Solver, _evaluate_objective, find_mu_range
+from ._solver import FitHistory, Solver, _evaluate_objective
 from ._typing import FloatArray, MuArg, MusArg
 
 
@@ -336,52 +335,11 @@ class NCRF:
         Returns the chosen ``mu`` and, when cross-validation was performed, the
         list of :class:`CVResult`.
         """
-        logger = logging.getLogger(__name__)
         if not do_crossvalidation:
             if mu is None:
                 raise TypeError(f'{mu=}: fit needs mu to be a number or "auto"')
             return mu, None
-
-        if mus == 'auto':
-            mus = find_mu_range(self._new_solver().gradient(data))
-        logger.info('Crossvalidation initiated!')
-        cv_results = crossvalidate(self, data, mus, tol, n_splits, n_workers)
-        best_cv = min(cv_results, key=attrgetter('cross_fit'))
-        if best_cv.mu == min(mus):
-            logger.info(f'CVmu is {best_cv.mu}: extending range of mu towards left')
-            new_mus = np.logspace(np.log10(best_cv.mu) - 1, np.log10(best_cv.mu), 4)[:-1]
-        elif best_cv.mu == max(mus):
-            logger.info(f'CVmu is {best_cv.mu}: extending range of mu towards right')
-            new_mus = np.logspace(np.log10(best_cv.mu), np.log10(best_cv.mu) + 1, 4)[1:]
-        else:
-            new_mus = None
-
-        if new_mus is not None:
-            cv_results.extend(crossvalidate(self, data, new_mus, tol, n_splits, n_workers))
-            best_cv = min(cv_results, key=attrgetter('cross_fit'))
-
-        mu = best_cv.mu
-        if use_ES:
-            cv_results_ = sorted(cv_results, key=attrgetter('mu'))
-            if mu == cv_results[-1].mu:
-                logger.info(f'\nCVmu is {best_cv.mu}: could not find mu based on estimation stability criterion\nContinuing with cross-validation only.')
-            else:
-                best_es = None
-                for i, res in enumerate(cv_results_):
-                    if res.mu < mu:
-                        continue
-                    else:
-                        try:
-                            if res.estimation_stability < cv_results_[i + 1].estimation_stability:
-                                best_es = res
-                                break
-                        except IndexError:
-                            best_es = None
-                if best_es is None:
-                    logger.warning('\nNo ES minima found: could not find mu based on estimation stability criterion.\nContinuing with cross-validation only.')
-                else:
-                    mu = best_es.mu
-        return mu, cv_results
+        return select_mu(self, data, mus, tol, n_splits, n_workers, use_ES)
 
 
 class NCRFResult:
@@ -444,9 +402,9 @@ class NCRFResult:
         fmt = '%.5f'
         for result in cv_results:
             table.cell(fmtxt.stat(result.mu, fmt=fmt))
-            star = 1 if result.mu is best_mu['cross-fit'] else 0
+            star = 1 if result.mu == best_mu['cross-fit'] else 0
             table.cell(fmtxt.stat(result.cross_fit, fmt, star, 1))
-            star = 1 if result.mu is best_mu['l2/mu'] else 0
+            star = 1 if result.mu == best_mu['l2/mu'] else 0
             table.cell(fmtxt.stat(result.l2_error, fmt, star, 1))
             table.cell(fmtxt.stat(result.weighted_l2_error, fmt=fmt))
             table.cell(fmtxt.stat(result.estimation_stability, fmt=fmt))
@@ -471,18 +429,4 @@ class NCRFResult:
             - ``'l2'``: The smallest l2 error
             - ``'l2/mu'``: The local minimum in the l2 error with smallest mu
         """
-        if criterion == 'cross-fit':
-            best_cv = min(self._cv_results, key=attrgetter('cross_fit'))
-        elif criterion == 'l2':
-            best_cv = min(self._cv_results, key=attrgetter('l2_error'))
-        elif criterion == 'l2/mu':
-            cv_results = sorted(self._cv_results, key=attrgetter('mu'))
-            peaks, _ = find_peaks([-result.l2_error for result in cv_results])  # find local minima
-            if len(peaks) > 0:
-                # higher mu -> smaller trf
-                best_cv = max([cv_results[peak] for peak in peaks], key=attrgetter('mu'))
-            else:
-                best_cv = min(cv_results, key=attrgetter('l2_error'))
-        else:
-            raise ValueError(f'criterion={criterion}')
-        return best_cv.mu
+        return select_best_mu(self._cv_results, criterion)
